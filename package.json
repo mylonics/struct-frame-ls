@@ -2,20 +2,28 @@
   "name": "struct-frame-ls",
   "displayName": "Struct Frame Language Support",
   "description": "Language support for struct-frame (.sf) files",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "mylonics",
   "engines": {
     "vscode": "^1.75.0"
   },
-  "categories": ["Programming Languages"],
-  "activationEvents": ["onLanguage:struct-frame"],
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:struct-frame"
+  ],
   "main": "./client/out/extension",
   "contributes": {
     "languages": [
       {
         "id": "struct-frame",
-        "extensions": [".sf"],
-        "aliases": ["Struct Frame"],
+        "extensions": [
+          ".sf"
+        ],
+        "aliases": [
+          "Struct Frame"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -27,6 +35,10 @@
       }
     ]
   },
+  "workspaces": [
+    "client",
+    "server"
+  ],
   "scripts": {
     "compile": "tsc -b",
     "watch": "tsc -b -w",
