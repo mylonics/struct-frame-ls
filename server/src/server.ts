@@ -21,6 +21,7 @@ import {
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
@@ -243,7 +244,7 @@ function getOrParseDocument(uri: string): ParsedDocument {
   } else {
     // Try reading from filesystem
     try {
-      const filePath = uri.startsWith('file://') ? new URL(uri).pathname : uri;
+      const filePath = uri.startsWith('file://') ? fileURLToPath(uri) : uri;
       content = fs.readFileSync(filePath, 'utf-8');
     } catch {
       return { uri, packageName: '', imports: [], messages: [], enums: [] };
@@ -256,7 +257,7 @@ function getOrParseDocument(uri: string): ParsedDocument {
 }
 
 function resolveImportUri(importPath: string, currentUri: string): string {
-  const currentFilePath = currentUri.startsWith('file://') ? new URL(currentUri).pathname : currentUri;
+  const currentFilePath = currentUri.startsWith('file://') ? fileURLToPath(currentUri) : currentUri;
   const currentDir = path.dirname(currentFilePath);
   const resolvedPath = path.resolve(currentDir, importPath);
   return `file://${resolvedPath}`;
