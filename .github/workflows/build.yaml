@@ -1,0 +1,39 @@
+name: Build VSIX
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Compile Extension
+        run: npm run compile
+
+      - name: Package VSIX
+        run: npx vsce package -o struct-frame-ls.vsix
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: struct-frame-ls.vsix
+          path: ./struct-frame-ls.vsix
