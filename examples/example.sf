@@ -1,0 +1,35 @@
+// Example struct-frame file demonstrating syntax
+
+package sensor_data;
+
+option pkgid = 1;
+
+import "other_file.sf";
+
+/* Enum for sensor status */
+enum SensorStatus {
+  OFFLINE = 0;
+  ONLINE = 1;
+  ERROR = 2;
+}
+
+message SensorReading {
+  option msgid = 1;
+  option variable = true;
+
+  SensorStatus status = 1;
+  float value = 2;
+  string name = 3 [size=16];
+  repeated uint8 data = 4 [max_size=200];
+  uint32 timestamp = 5;
+}
+
+message Container {
+  option msgid = 2;
+  SensorReading reading = 1 [flatten=true];
+
+  oneof payload {
+    SensorReading sensor = 1;
+    SensorReading other = 2;
+  }
+}
