@@ -14,7 +14,7 @@
     "languages": [
       {
         "id": "struct-frame",
-        "extensions": [".sf", ".proto"],
+        "extensions": [".sf"],
         "aliases": ["Struct Frame"],
         "configuration": "./language-configuration.json"
       }

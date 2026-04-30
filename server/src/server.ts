@@ -293,13 +293,13 @@ function getWordAtPosition(text: string, position: Position): { word: string; st
   return { word, start, end };
 }
 
-let _hasConfigurationCapability = false;
-let _hasWorkspaceFolderCapability = false;
+let hasConfigurationCapability = false;
+let hasWorkspaceFolderCapability = false;
 
 connection.onInitialize((params: InitializeParams) => {
   const capabilities = params.capabilities;
-  _hasConfigurationCapability = !!(capabilities.workspace && !!capabilities.workspace.configuration);
-  _hasWorkspaceFolderCapability = !!(capabilities.workspace && !!capabilities.workspace.workspaceFolders);
+  hasConfigurationCapability = !!(capabilities.workspace && !!capabilities.workspace.configuration);
+  hasWorkspaceFolderCapability = !!(capabilities.workspace && !!capabilities.workspace.workspaceFolders);
 
   const result: InitializeResult = {
     capabilities: {
@@ -314,7 +314,7 @@ connection.onInitialize((params: InitializeParams) => {
     }
   };
 
-  if (_hasWorkspaceFolderCapability) {
+  if (hasWorkspaceFolderCapability) {
     result.capabilities.workspace = {
       workspaceFolders: { supported: true }
     };
@@ -324,7 +324,7 @@ connection.onInitialize((params: InitializeParams) => {
 });
 
 connection.onInitialized(() => {
-  if (_hasConfigurationCapability) {
+  if (hasConfigurationCapability) {
     connection.client.register(DidChangeConfigurationNotification.type, undefined);
   }
 });

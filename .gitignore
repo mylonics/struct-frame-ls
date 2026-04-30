@@ -3,3 +3,4 @@ client/out/
 server/out/
 out/
 *.vsix
+*.tsbuildinfo
