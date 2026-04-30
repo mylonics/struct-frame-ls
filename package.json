@@ -4,6 +4,10 @@
   "description": "Language support for struct-frame (.sf) files",
   "version": "0.1.1",
   "publisher": "mylonics",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mylonics/struct-frame-ls.git"
+  },
   "engines": {
     "vscode": "^1.75.0"
   },
@@ -40,6 +44,7 @@
     "server"
   ],
   "scripts": {
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -b",
     "watch": "tsc -b -w",
     "package": "vsce package"
