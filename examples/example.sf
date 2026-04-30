@@ -29,7 +29,7 @@ message Container {
   SensorReading reading = 1 [flatten=true];
 
   oneof payload {
-    SensorReading sensor = 1;
-    SensorReading other = 2;
+    SensorReading sensor = 2;
+    SensorReading other = 3;
   }
 }
