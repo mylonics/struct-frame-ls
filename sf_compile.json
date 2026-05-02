@@ -1,0 +1,597 @@
+{
+  "messages": [
+    {
+      "name": "Message",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/Message.cs"
+      }
+    },
+    {
+      "name": "FirmwareUpdateCommand",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/FirmwareUpdateCommand.cs"
+      }
+    },
+    {
+      "name": "FirmwareUpdateWithImageIdCommand",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/FirmwareUpdateWithImageIdCommand.cs"
+      }
+    },
+    {
+      "name": "FirmwareUpdateChunk",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/FirmwareUpdateChunk.cs"
+      }
+    },
+    {
+      "name": "FirmwareUpdateChunkSmall",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/FirmwareUpdateChunkSmall.cs"
+      }
+    },
+    {
+      "name": "FirmwareUpdateComplete",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/FirmwareUpdateComplete.cs"
+      }
+    },
+    {
+      "name": "FirmwareUpdateChunkAck",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/FirmwareUpdateChunkAck.cs"
+      }
+    },
+    {
+      "name": "SetLogLevelCommand",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/SetLogLevelCommand.cs"
+      }
+    },
+    {
+      "name": "NfcScanResponse",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/NfcScanResponse.cs"
+      }
+    },
+    {
+      "name": "TestCartridgeResponse",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/TestCartridgeResponse.cs"
+      }
+    },
+    {
+      "name": "DetectCartridgeResponse",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/DetectCartridgeResponse.cs"
+      }
+    },
+    {
+      "name": "JobStatusMessage",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/JobStatusMessage.cs"
+      }
+    },
+    {
+      "name": "AdcDataPoint",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/AdcDataPoint.cs"
+      }
+    },
+    {
+      "name": "DataPoint",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/DataPoint.cs"
+      }
+    },
+    {
+      "name": "ImpedanceDataPoint",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/ImpedanceDataPoint.cs"
+      }
+    },
+    {
+      "name": "AdcCommand",
+      "package": "biostream",
+      "source_file": "job_electrochemical.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/AdcCommand.cs"
+      }
+    },
+    {
+      "name": "DacCommand",
+      "package": "biostream",
+      "source_file": "job_electrochemical.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/DacCommand.cs"
+      }
+    },
+    {
+      "name": "LinearSweepCommand",
+      "package": "biostream",
+      "source_file": "job_electrochemical.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/LinearSweepCommand.cs"
+      }
+    },
+    {
+      "name": "DifferentialPulseCommand",
+      "package": "biostream",
+      "source_file": "job_electrochemical.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/DifferentialPulseCommand.cs"
+      }
+    },
+    {
+      "name": "SquareWaveCommand",
+      "package": "biostream",
+      "source_file": "job_electrochemical.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/SquareWaveCommand.cs"
+      }
+    },
+    {
+      "name": "CaptureConstantCurrentCommand",
+      "package": "biostream",
+      "source_file": "job_electrochemical.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/CaptureConstantCurrentCommand.cs"
+      }
+    },
+    {
+      "name": "ConstantCurrentCommand",
+      "package": "biostream",
+      "source_file": "job_electrochemical.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/ConstantCurrentCommand.cs"
+      }
+    },
+    {
+      "name": "EisCommand",
+      "package": "biostream",
+      "source_file": "job_electrochemical.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/EisCommand.cs"
+      }
+    },
+    {
+      "name": "SerialNumberCommand",
+      "package": "biostream",
+      "source_file": "job_system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/SerialNumberCommand.cs"
+      }
+    },
+    {
+      "name": "GetCalibrationCommand",
+      "package": "biostream",
+      "source_file": "job_system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/GetCalibrationCommand.cs"
+      }
+    },
+    {
+      "name": "GetFirmwareVersionCommand",
+      "package": "biostream",
+      "source_file": "job_system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/GetFirmwareVersionCommand.cs"
+      }
+    },
+    {
+      "name": "TestBoardDetailsCommand",
+      "package": "biostream",
+      "source_file": "job_system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/TestBoardDetailsCommand.cs"
+      }
+    },
+    {
+      "name": "CalibrateCommand",
+      "package": "biostream",
+      "source_file": "job_system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/CalibrateCommand.cs"
+      }
+    },
+    {
+      "name": "GetCalibrationResponse",
+      "package": "biostream",
+      "source_file": "job_system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/GetCalibrationResponse.cs"
+      }
+    },
+    {
+      "name": "GetDeviceDetailsCommand",
+      "package": "biostream",
+      "source_file": "job_system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/GetDeviceDetailsCommand.cs"
+      }
+    },
+    {
+      "name": "GetDeviceDetailsResponse",
+      "package": "biostream",
+      "source_file": "job_system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/GetDeviceDetailsResponse.cs"
+      }
+    },
+    {
+      "name": "CharacterizeCommand",
+      "package": "biostream",
+      "source_file": "job_system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/CharacterizeCommand.cs"
+      }
+    },
+    {
+      "name": "SensorSerialNumberCommand",
+      "package": "biostream",
+      "source_file": "job_sensor.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/SensorSerialNumberCommand.cs"
+      }
+    },
+    {
+      "name": "SetExternalIoCommand",
+      "package": "biostream",
+      "source_file": "job_sensor.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/SetExternalIoCommand.cs"
+      }
+    },
+    {
+      "name": "PinMultiplexCommand",
+      "package": "biostream",
+      "source_file": "job_sensor.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/PinMultiplexCommand.cs"
+      }
+    },
+    {
+      "name": "NfcScanCommand",
+      "package": "biostream",
+      "source_file": "job_sensor.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/NfcScanCommand.cs"
+      }
+    },
+    {
+      "name": "TestCartridgeCommand",
+      "package": "biostream",
+      "source_file": "job_sensor.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/TestCartridgeCommand.cs"
+      }
+    },
+    {
+      "name": "DetectCartridgeCommand",
+      "package": "biostream",
+      "source_file": "job_sensor.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/DetectCartridgeCommand.cs"
+      }
+    },
+    {
+      "name": "JobMessage",
+      "package": "biostream",
+      "source_file": "biostream.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/JobMessage.cs"
+      }
+    },
+    {
+      "name": "JobAbortCommand",
+      "package": "biostream",
+      "source_file": "biostream.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Messages/JobAbortCommand.cs"
+      }
+    }
+  ],
+  "nested_messages": [],
+  "enums": [
+    {
+      "name": "LogLevel",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/LogLevel.cs"
+      }
+    },
+    {
+      "name": "CommandAction",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/CommandAction.cs"
+      }
+    },
+    {
+      "name": "CommandState",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/CommandState.cs"
+      }
+    },
+    {
+      "name": "GainSetting",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/GainSetting.cs"
+      }
+    },
+    {
+      "name": "CalibrationMode",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/CalibrationMode.cs"
+      }
+    },
+    {
+      "name": "AdcMode",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/AdcMode.cs"
+      }
+    },
+    {
+      "name": "Direction",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/Direction.cs"
+      }
+    },
+    {
+      "name": "JobStatus",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/JobStatus.cs"
+      }
+    },
+    {
+      "name": "Electrode",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/Electrode.cs"
+      }
+    },
+    {
+      "name": "PinMuxMode",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/PinMuxMode.cs"
+      }
+    },
+    {
+      "name": "DftNum",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/DftNum.cs"
+      }
+    },
+    {
+      "name": "DftSrc",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/DftSrc.cs"
+      }
+    },
+    {
+      "name": "RtiaValue",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/RtiaValue.cs"
+      }
+    },
+    {
+      "name": "RcalValue",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/RcalValue.cs"
+      }
+    },
+    {
+      "name": "AdcRate",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/AdcRate.cs"
+      }
+    },
+    {
+      "name": "AdcAvgNum",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/AdcAvgNum.cs"
+      }
+    },
+    {
+      "name": "Sinc2Osr",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/Sinc2Osr.cs"
+      }
+    },
+    {
+      "name": "Sinc3Osr",
+      "package": "biostream",
+      "source_file": "common.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/Sinc3Osr.cs"
+      }
+    },
+    {
+      "name": "EisConfigChangeReason",
+      "package": "biostream",
+      "source_file": "system.sf",
+      "generated_files": {
+        "cpp": "cpp/biostream.structframe.hpp",
+        "ts": "ts/biostream.structframe.ts",
+        "csharp": "../StructFrame/Biostream/Enums/EisConfigChangeReason.cs"
+      }
+    }
+  ]
+}

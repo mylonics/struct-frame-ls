@@ -16,12 +16,13 @@ import {
   MarkupKind,
   DocumentSymbol,
   SymbolKind,
-  Definition
+  Definition,
+  FileChangeType
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
 import * as path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
@@ -65,6 +66,81 @@ interface ParsedDocument {
 }
 
 const parsedDocuments = new Map<string, ParsedDocument>();
+
+// --- sf_compile.json support ---
+
+interface SfCompileGeneratedFileEntry {
+  path: string;
+  namespace: string | null;
+  element: string;
+  qualified_element: string;
+}
+
+interface SfCompileGeneratedFiles {
+  [key: string]: SfCompileGeneratedFileEntry | undefined;
+}
+
+interface SfCompileEntry {
+  name: string;
+  package: string;
+  source_file: string;
+  generated_files: SfCompileGeneratedFiles;
+}
+
+interface SfCompileConfig {
+  messages: SfCompileEntry[];
+  nested_messages?: SfCompileEntry[];
+  enums: SfCompileEntry[];
+}
+
+let sfCompileConfig: SfCompileConfig | null = null;
+let sfCompileConfigPath = 'sf_compile.json';
+let workspaceRoot = '';
+
+function loadSfCompileConfig(): void {
+  if (!workspaceRoot) return;
+  let configPath = sfCompileConfigPath;
+  if (!path.isAbsolute(configPath)) {
+    configPath = path.join(workspaceRoot, configPath);
+  }
+  try {
+    const content = fs.readFileSync(configPath, 'utf-8');
+    sfCompileConfig = JSON.parse(content) as SfCompileConfig;
+  } catch {
+    sfCompileConfig = null;
+  }
+}
+
+function findInCompileConfig(name: string): SfCompileEntry | null {
+  if (!sfCompileConfig) return null;
+  return (
+    sfCompileConfig.messages.find(m => m.name === name) ||
+    (sfCompileConfig.nested_messages ?? []).find(m => m.name === name) ||
+    sfCompileConfig.enums.find(e => e.name === name) ||
+    null
+  );
+}
+
+function isEnumInCompileConfig(name: string): boolean {
+  if (!sfCompileConfig) return false;
+  return sfCompileConfig.enums.some(e => e.name === name);
+}
+
+function getCompileConfigSourceDir(): string {
+  if (!workspaceRoot) return '';
+  let configPath = sfCompileConfigPath;
+  if (!path.isAbsolute(configPath)) {
+    configPath = path.join(workspaceRoot, configPath);
+  }
+  return path.dirname(configPath);
+}
+
+async function refreshConfiguration(): Promise<void> {
+  if (!hasConfigurationCapability) return;
+  const config = await connection.workspace.getConfiguration('structFrameLs');
+  sfCompileConfigPath = (config?.compileConfigPath as string) || 'sf_compile.json';
+  loadSfCompileConfig();
+}
 
 const PRIMITIVE_TYPES = [
   'int8', 'int16', 'int32', 'int64',
@@ -260,7 +336,7 @@ function resolveImportUri(importPath: string, currentUri: string): string {
   const currentFilePath = currentUri.startsWith('file://') ? fileURLToPath(currentUri) : currentUri;
   const currentDir = path.dirname(currentFilePath);
   const resolvedPath = path.resolve(currentDir, importPath);
-  return `file://${resolvedPath}`;
+  return pathToFileURL(resolvedPath).toString();
 }
 
 function getAllDefinitions(uri: string, visited = new Set<string>()): { messages: MessageDefinition[]; enums: EnumDefinition[] } {
@@ -320,12 +396,36 @@ connection.onInitialize((params: InitializeParams) => {
     };
   }
 
+  // Capture workspace root for sf_compile.json resolution
+  if (params.workspaceFolders && params.workspaceFolders.length > 0) {
+    const folderUri = params.workspaceFolders[0].uri;
+    workspaceRoot = folderUri.startsWith('file://') ? fileURLToPath(folderUri) : folderUri;
+  }
+
   return result;
 });
 
-connection.onInitialized(() => {
+connection.onInitialized(async () => {
   if (hasConfigurationCapability) {
     connection.client.register(DidChangeConfigurationNotification.type, undefined);
+  }
+  await refreshConfiguration();
+});
+
+connection.onDidChangeConfiguration(async () => {
+  await refreshConfiguration();
+});
+
+connection.onDidChangeWatchedFiles(params => {
+  for (const change of params.changes) {
+    if (change.uri.endsWith('sf_compile.json')) {
+      loadSfCompileConfig();
+    }
+    if (change.type === FileChangeType.Deleted) {
+      parsedDocuments.delete(change.uri);
+    } else {
+      parsedDocuments.delete(change.uri);
+    }
   }
 });
 
@@ -339,6 +439,31 @@ documents.onDidClose(e => {
 });
 
 // Completion
+function getCompileConfigCompletionItems(existingDefs: { messages: MessageDefinition[]; enums: EnumDefinition[] }): CompletionItem[] {
+  if (!sfCompileConfig) return [];
+  const existingNames = new Set([
+    ...existingDefs.messages.map(m => m.name),
+    ...existingDefs.enums.map(e => e.name)
+  ]);
+  const items: CompletionItem[] = [];
+  for (const entry of sfCompileConfig.messages) {
+    if (!existingNames.has(entry.name)) {
+      items.push({ label: entry.name, kind: CompletionItemKind.Class, detail: `Message (${entry.package})` });
+    }
+  }
+  for (const entry of (sfCompileConfig.nested_messages ?? [])) {
+    if (!existingNames.has(entry.name)) {
+      items.push({ label: entry.name, kind: CompletionItemKind.Class, detail: `Nested message (${entry.package})` });
+    }
+  }
+  for (const entry of sfCompileConfig.enums) {
+    if (!existingNames.has(entry.name)) {
+      items.push({ label: entry.name, kind: CompletionItemKind.Enum, detail: `Enum (${entry.package})` });
+    }
+  }
+  return items;
+}
+
 connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
@@ -422,7 +547,7 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
         detail: 'Enum type'
       }));
 
-      return [...primitiveItems, ...messageItems, ...enumItems];
+      return [...primitiveItems, ...messageItems, ...enumItems, ...getCompileConfigCompletionItems(allDefs)];
     }
 
     // Inside message, at start of line - suggest keywords for inside message
@@ -448,7 +573,7 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
         kind: CompletionItemKind.Enum,
         detail: 'Enum type'
       }));
-      return [...insideMessageKeywords, ...primitiveItems, ...messageItems, ...enumItems];
+      return [...insideMessageKeywords, ...primitiveItems, ...messageItems, ...enumItems, ...getCompileConfigCompletionItems(allDefs)];
     }
   }
 
@@ -498,8 +623,92 @@ connection.onDefinition((params: TextDocumentPositionParams): Definition | null 
     return null;
   }
 
-  return findDefinition(params.textDocument.uri);
+  const sfLocation = findDefinition(params.textDocument.uri);
+
+  // Determine context: are we on the declaration line itself, or referencing a type in a field?
+  const text = doc.getText();
+  const lineText = text.split('\n')[params.position.line] || '';
+  const isDeclaration = new RegExp(`^\\s*(message|enum)\\s+${word}\\b`).test(lineText);
+
+  if (isDeclaration) {
+    // On the declaration → peek all generated files (no .sf)
+    const generatedLocations = findGeneratedFileLocations(word);
+    if (generatedLocations.length === 0) return null;
+    if (generatedLocations.length === 1) return generatedLocations[0];
+    return generatedLocations;
+  } else {
+    // Field type reference → navigate to .sf definition only
+    return sfLocation || findSfSourceLocation(word);
+  }
 });
+
+function findElementLineInFile(filePath: string, elementName: string): number {
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const lines = content.split('\n');
+    const re = new RegExp(`\\b${elementName}\\b`);
+    const idx = lines.findIndex(l => re.test(l));
+    return idx >= 0 ? idx : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function findSfSourceLocation(word: string): Location | null {
+  const entry = findInCompileConfig(word);
+  if (!entry || !entry.source_file) return null;
+  const sourceDir = getCompileConfigSourceDir();
+  if (!sourceDir) return null;
+  const sourceFilePath = path.resolve(sourceDir, entry.source_file);
+  try {
+    if (!fs.statSync(sourceFilePath).isFile()) return null;
+  } catch { return null; }
+  const sourceUri = pathToFileURL(sourceFilePath).toString();
+  const parsed = getOrParseDocument(sourceUri);
+  const msg = parsed.messages.find(m => m.name === word);
+  if (msg) return Location.create(sourceUri, Range.create(msg.line, 0, msg.line, word.length + 8));
+  const enm = parsed.enums.find(e => e.name === word);
+  if (enm) return Location.create(sourceUri, Range.create(enm.line, 0, enm.line, word.length + 5));
+  return null;
+}
+
+function findGeneratedFileLocations(word: string): Location[] {
+  const entry = findInCompileConfig(word);
+  if (!entry) return [];
+  const sourceDir = getCompileConfigSourceDir();
+  if (!sourceDir) return [];
+  const locations: Location[] = [];
+  const seen = new Set<string>();
+  for (const fileEntry of Object.values(entry.generated_files)) {
+    if (!fileEntry?.path) continue;
+    const absPath = path.resolve(sourceDir, fileEntry.path);
+    if (seen.has(absPath)) continue;
+    seen.add(absPath);
+    try {
+      if (!fs.statSync(absPath).isFile()) continue;
+    } catch { continue; }
+    const fileUri = pathToFileURL(absPath).toString();
+    const line = findElementLineInFile(absPath, fileEntry.element);
+    locations.push(Location.create(fileUri, Range.create(line, 0, line, fileEntry.element.length)));
+  }
+  return locations;
+}
+
+function buildGeneratedFilesMarkdown(entry: SfCompileEntry): string {
+  const files = entry.generated_files;
+  const lines = Object.entries(files)
+    .filter(([, v]) => v)
+    .map(([lang, info]) => {
+      const detail = info!.namespace
+        ? `\`${info!.element}\` (ns: \`${info!.namespace}\`)`
+        : `\`${info!.element}\``;
+      return `- **${lang}**: \`${info!.path}\` — ${detail}`;
+    });
+  if (lines.length === 0) return '';
+  const encodedArgs = encodeURIComponent(JSON.stringify([{ name: entry.name }]));
+  const peekLink = `[Peek generated files](command:structFrameLs.showGeneratedFiles?${encodedArgs})`;
+  return `\n\n---\n**Generated files** (source: \`${entry.source_file}\`) — ${peekLink}\n${lines.join('\n')}`;
+}
 
 // Hover
 connection.onHover((params: TextDocumentPositionParams): Hover | null => {
@@ -523,26 +732,63 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
 
   // User-defined type hover
   if (/^[A-Z]/.test(word)) {
+    const text = doc.getText();
+    const lineText = text.split('\n')[params.position.line] || '';
+    const isDeclaration = new RegExp(`^\\s*(message|enum)\\s+${word}\\b`).test(lineText);
     const allDefs = getAllDefinitions(params.textDocument.uri);
 
     const msg = allDefs.messages.find(m => m.name === word);
     if (msg) {
+      const compileEntry = findInCompileConfig(word);
+      const generatedSection = compileEntry ? buildGeneratedFilesMarkdown(compileEntry) : '';
+      if (isDeclaration) {
+        // On the declaration line — just show generated files, no redundant struct body
+        return {
+          contents: {
+            kind: MarkupKind.Markdown,
+            value: `**message ${word}**${generatedSection}`
+          }
+        };
+      }
       const fieldLines = msg.fields.map(f => `  ${f.repeated ? 'repeated ' : ''}${f.type} ${f.name} = ${f.tag};`).join('\n');
       return {
         contents: {
           kind: MarkupKind.Markdown,
-          value: `**message ${word}**\n\`\`\`sf\nmessage ${word} {\n${fieldLines}\n}\n\`\`\``
+          value: `**message ${word}**\n\`\`\`sf\nmessage ${word} {\n${fieldLines}\n}\n\`\`\`${generatedSection}`
         }
       };
     }
 
     const enm = allDefs.enums.find(e => e.name === word);
     if (enm) {
+      const compileEntry = findInCompileConfig(word);
+      const generatedSection = compileEntry ? buildGeneratedFilesMarkdown(compileEntry) : '';
+      if (isDeclaration) {
+        return {
+          contents: {
+            kind: MarkupKind.Markdown,
+            value: `**enum ${word}**${generatedSection}`
+          }
+        };
+      }
       const valueLines = enm.values.map(v => `  ${v.name} = ${v.value};`).join('\n');
       return {
         contents: {
           kind: MarkupKind.Markdown,
-          value: `**enum ${word}**\n\`\`\`sf\nenum ${word} {\n${valueLines}\n}\n\`\`\``
+          value: `**enum ${word}**\n\`\`\`sf\nenum ${word} {\n${valueLines}\n}\n\`\`\`${generatedSection}`
+        }
+      };
+    }
+
+    // Not found via imports - check compile config for cross-file types
+    const compileEntry = findInCompileConfig(word);
+    if (compileEntry) {
+      const generatedSection = buildGeneratedFilesMarkdown(compileEntry);
+      const kind = isEnumInCompileConfig(word) ? 'enum' : 'message';
+      return {
+        contents: {
+          kind: MarkupKind.Markdown,
+          value: `**${kind} ${word}** (package: \`${compileEntry.package}\`)${generatedSection}`
         }
       };
     }
@@ -560,7 +806,7 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
   const symbols: DocumentSymbol[] = [];
 
   for (const msg of parsed.messages) {
-    const msgRange = Range.create(msg.line, 0, msg.endLine, 0);
+    const msgRange = Range.create(msg.line, 0, msg.endLine + 1, 0);
     const msgSymbol: DocumentSymbol = {
       name: msg.name,
       kind: SymbolKind.Class,
@@ -570,7 +816,7 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
         name: f.name,
         detail: `${f.repeated ? 'repeated ' : ''}${f.type}`,
         kind: SymbolKind.Field,
-        range: Range.create(f.line, 0, f.line, 0),
+        range: Range.create(f.line, 0, f.line + 1, 0),
         selectionRange: Range.create(f.line, 0, f.line, f.name.length)
       }))
     };
@@ -578,7 +824,7 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
   }
 
   for (const enm of parsed.enums) {
-    const enumRange = Range.create(enm.line, 0, enm.endLine, 0);
+    const enumRange = Range.create(enm.line, 0, enm.endLine + 1, 0);
     const enumSymbol: DocumentSymbol = {
       name: enm.name,
       kind: SymbolKind.Enum,
@@ -588,7 +834,7 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
         name: v.name,
         detail: `= ${v.value}`,
         kind: SymbolKind.EnumMember,
-        range: Range.create(v.line, 0, v.line, 0),
+        range: Range.create(v.line, 0, v.line + 1, 0),
         selectionRange: Range.create(v.line, 0, v.line, v.name.length)
       }))
     };
