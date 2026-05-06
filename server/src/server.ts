@@ -6,6 +6,7 @@ import {
   DidChangeConfigurationNotification,
   CompletionItem,
   CompletionItemKind,
+  InsertTextFormat,
   TextDocumentPositionParams,
   TextDocumentSyncKind,
   InitializeResult,
@@ -16,10 +17,18 @@ import {
   MarkupKind,
   DocumentSymbol,
   SymbolKind,
+  SymbolInformation,
   Definition,
   FileChangeType,
   Diagnostic,
-  DiagnosticSeverity
+  DiagnosticSeverity,
+  CodeAction,
+  CodeActionKind,
+  CodeActionParams,
+  TextEdit,
+  WorkspaceEdit,
+  FoldingRange,
+  FoldingRangeKind,
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
@@ -52,6 +61,7 @@ interface MessageDefinition {
   endLine: number;
   fields: FieldDefinition[];
   oneofs: OneofDefinition[];
+  nestedMessages: MessageDefinition[];
   options: Record<string, string>;
   optionLines: Record<string, number>;
 }
@@ -74,6 +84,7 @@ interface ParsedDocument {
   uri: string;
   packageName: string;
   imports: string[];
+  importLines: Record<string, number>;
   messages: MessageDefinition[];
   enums: EnumDefinition[];
   fileOptions: Record<string, string>;
@@ -220,6 +231,7 @@ function parseDocument(uri: string, content: string): ParsedDocument {
     uri,
     packageName: '',
     imports: [],
+    importLines: {},
     messages: [],
     enums: [],
     fileOptions: {},
@@ -227,6 +239,7 @@ function parseDocument(uri: string, content: string): ParsedDocument {
   };
 
   let currentMessage: MessageDefinition | null = null;
+  let currentNestedMessage: MessageDefinition | null = null;
   let currentEnum: EnumDefinition | null = null;
   let currentNestedEnum: EnumDefinition | null = null;
   let currentOneof: OneofDefinition | null = null;
@@ -253,6 +266,7 @@ function parseDocument(uri: string, content: string): ParsedDocument {
       const importMatch = trimmed.match(/^import\s+"([^"]+)"\s*;/);
       if (importMatch) {
         doc.imports.push(importMatch[1]);
+        doc.importLines[importMatch[1]] = i;
         continue;
       }
 
@@ -273,6 +287,7 @@ function parseDocument(uri: string, content: string): ParsedDocument {
           endLine: i,
           fields: [],
           oneofs: [],
+          nestedMessages: [],
           options: {},
           optionLines: {}
         };
@@ -296,7 +311,7 @@ function parseDocument(uri: string, content: string): ParsedDocument {
 
     if (braceDepth > 0) {
       // Detect nested enum start (inside a message, before counting braces)
-      if (currentMessage && !currentNestedEnum && !currentOneof && braceDepth === 1) {
+      if (currentMessage && !currentNestedMessage && !currentNestedEnum && !currentOneof && braceDepth === 1) {
         const nestedEnumMatch = trimmed.match(/^enum\s+([A-Z][a-zA-Z0-9_]*)\s*\{/);
         if (nestedEnumMatch) {
           currentNestedEnum = {
@@ -311,8 +326,27 @@ function parseDocument(uri: string, content: string): ParsedDocument {
         }
       }
 
+      // Detect nested message start (inside a message, before counting braces)
+      if (currentMessage && !currentNestedMessage && !currentNestedEnum && !currentOneof && braceDepth === 1) {
+        const nestedMsgMatch = trimmed.match(/^message\s+([A-Z][a-zA-Z0-9_]*)\s*\{/);
+        if (nestedMsgMatch) {
+          currentNestedMessage = {
+            name: nestedMsgMatch[1],
+            line: i,
+            endLine: i,
+            fields: [],
+            oneofs: [],
+            nestedMessages: [],
+            options: {},
+            optionLines: {}
+          };
+          braceDepth = 2;
+          continue;
+        }
+      }
+
       // Detect oneof start (inside a message, before counting braces)
-      if (currentMessage && !currentNestedEnum && !currentOneof && braceDepth === 1) {
+      if (currentMessage && !currentNestedMessage && !currentNestedEnum && !currentOneof && braceDepth === 1) {
         const oneofMatch = trimmed.match(/^oneof\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\{/);
         if (oneofMatch) {
           currentOneof = {
@@ -356,11 +390,45 @@ function parseDocument(uri: string, content: string): ParsedDocument {
         continue;
       }
 
+      // Nested message closing (depth went from 2 back to 1)
+      if (currentNestedMessage && braceDepth === 1) {
+        currentNestedMessage.endLine = i;
+        currentMessage!.nestedMessages.push(currentNestedMessage);
+        // Also register as a top-level message so type resolution works across the file
+        doc.messages.push(currentNestedMessage);
+        currentNestedMessage = null;
+        continue;
+      }
+
       // Oneof closing (depth went from 2 back to 1)
       if (currentOneof && braceDepth === 1) {
         currentOneof.endLine = i;
         currentMessage!.oneofs.push(currentOneof);
         currentOneof = null;
+        continue;
+      }
+
+      if (currentNestedMessage) {
+        // Fields inside a nested message
+        const optMatch = trimmed.match(/^option\s+(\w+)\s*=\s*(.+?)\s*;/);
+        if (optMatch) {
+          currentNestedMessage.options[optMatch[1]] = optMatch[2];
+          currentNestedMessage.optionLines[optMatch[1]] = i;
+          continue;
+        }
+        const fieldMatch = trimmed.match(
+          /^(repeated\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([0-9]+)\s*(?:\[([^\]]*)\])?\s*;/
+        );
+        if (fieldMatch) {
+          currentNestedMessage.fields.push({
+            name: fieldMatch[3],
+            type: fieldMatch[2],
+            tag: parseInt(fieldMatch[4], 10),
+            repeated: !!fieldMatch[1],
+            options: fieldMatch[5] ? parseFieldOptions(fieldMatch[5]) : {},
+            line: i
+          });
+        }
         continue;
       }
 
@@ -455,12 +523,13 @@ function parseDocument(uri: string, content: string): ParsedDocument {
   return doc;
 }
 
-function makeDiagnostic(line: number, message: string, severity: DiagnosticSeverity = DiagnosticSeverity.Error): Diagnostic {
+function makeDiagnostic(line: number, message: string, severity: DiagnosticSeverity = DiagnosticSeverity.Error, data?: unknown): Diagnostic {
   return {
     severity,
     range: Range.create(line, 0, line, 10000),
     message,
-    source: 'struct-frame'
+    source: 'struct-frame',
+    data
   };
 }
 
@@ -471,6 +540,18 @@ function validateDocument(uri: string): void {
   // All known message names (including imports) for type resolution
   const allDefs = getAllDefinitions(uri);
   const messageNames = new Set(allDefs.messages.map(m => m.name));
+
+  // File-level: unknown option names
+  const VALID_FILE_OPTIONS = new Set(['pkgid']);
+  for (const optName of Object.keys(parsed.fileOptions)) {
+    if (!VALID_FILE_OPTIONS.has(optName)) {
+      diagnostics.push(makeDiagnostic(
+        parsed.fileOptionLines[optName] ?? 0,
+        `Unknown file-level option '${optName}'. Valid options: ${[...VALID_FILE_OPTIONS].join(', ')}`,
+        DiagnosticSeverity.Warning
+      ));
+    }
+  }
 
   // File-level: pkgid range 0–255
   const pkgidStr = parsed.fileOptions['pkgid'];
@@ -522,9 +603,58 @@ function validateDocument(uri: string): void {
       }
     }
 
+    // Unknown message-level option names
+    const VALID_MSG_OPTIONS = new Set(['msgid', 'variable', 'is_envelope']);
+    for (const optName of Object.keys(msg.options)) {
+      if (!VALID_MSG_OPTIONS.has(optName)) {
+        diagnostics.push(makeDiagnostic(
+          msg.optionLines[optName] ?? msg.line,
+          `Unknown message option '${optName}'. Valid options: ${[...VALID_MSG_OPTIONS].join(', ')}`,
+          DiagnosticSeverity.Warning
+        ));
+      }
+    }
+
+    // variable / is_envelope value validation
+    if (msg.options['variable'] !== undefined && msg.options['variable'] !== 'true' && msg.options['variable'] !== 'false') {
+      diagnostics.push(makeDiagnostic(msg.optionLines['variable'] ?? msg.line,
+        `option variable must be 'true' or 'false', got '${msg.options['variable']}'`));
+    }
+
+    // variable=true with no max_size fields is pointless
+    if (msg.options['variable'] === 'true') {
+      const allFields = [...msg.fields, ...msg.oneofs.flatMap(o => o.fields)];
+      const hasMaxSizeField = allFields.some(f => 'max_size' in f.options);
+      if (!hasMaxSizeField) {
+        diagnostics.push(makeDiagnostic(
+          msg.optionLines['variable'] ?? msg.line,
+          `option variable=true has no effect: no fields use [max_size=N] in '${msg.name}'`,
+          DiagnosticSeverity.Warning
+        ));
+      }
+    }
+    if (msg.options['is_envelope'] !== undefined && msg.options['is_envelope'] !== 'true' && msg.options['is_envelope'] !== 'false') {
+      diagnostics.push(makeDiagnostic(msg.optionLines['is_envelope'] ?? msg.line,
+        `option is_envelope must be 'true' or 'false', got '${msg.options['is_envelope']}'`));
+    }
+
+    // Unknown oneof-level option names
+    const VALID_ONEOF_OPTIONS = new Set(['discriminator']);
+    for (const oneof of msg.oneofs) {
+      for (const optName of Object.keys(oneof.options)) {
+        if (!VALID_ONEOF_OPTIONS.has(optName)) {
+          diagnostics.push(makeDiagnostic(
+            oneof.line,
+            `Unknown oneof option '${optName}'. Valid options: ${[...VALID_ONEOF_OPTIONS].join(', ')}`,
+            DiagnosticSeverity.Warning
+          ));
+        }
+      }
+    }
+
     // oneof discriminator validation
     for (const oneof of msg.oneofs) {
-      const disc = oneof.options['discriminator'];
+      const disc = (oneof.options['discriminator'] ?? '').replace(/"/g, '').trim();
       if (disc === 'msgid') {
         for (const field of oneof.fields) {
           const variantMsg = allDefs.messages.find(m => m.name === field.type);
@@ -534,6 +664,29 @@ function validateDocument(uri: string): void {
           } else if (!variantMsg.options['msgid']) {
             diagnostics.push(makeDiagnostic(field.line,
               `discriminator=msgid: variant '${field.name}' (type '${field.type}') does not have msgid`));
+          }
+        }
+      }
+    }
+
+    // Field number uniqueness within message (fields + all oneof variants share the same namespace)
+    {
+      const allTags = new Map<number, string>();
+      for (const field of msg.fields) {
+        if (allTags.has(field.tag)) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `Duplicate field number ${field.tag} in '${msg.name}' (already used by '${allTags.get(field.tag)}')`));
+        } else {
+          allTags.set(field.tag, field.name);
+        }
+      }
+      for (const oneof of msg.oneofs) {
+        for (const field of oneof.fields) {
+          if (allTags.has(field.tag)) {
+            diagnostics.push(makeDiagnostic(field.line,
+              `Duplicate field number ${field.tag} in '${msg.name}' (already used by '${allTags.get(field.tag)}')`));
+          } else {
+            allTags.set(field.tag, field.name);
           }
         }
       }
@@ -549,7 +702,8 @@ function validateDocument(uri: string): void {
         // Plain string: exactly one of size or max_size
         if (!hasSize && !hasMaxSize) {
           diagnostics.push(makeDiagnostic(field.line,
-            `String field '${field.name}' requires [size=N] or [max_size=N]`));
+            `String field '${field.name}' requires [size=N] or [max_size=N]`,
+            DiagnosticSeverity.Error, { fix: 'add_size', fieldLine: field.line }));
         } else if (hasSize && hasMaxSize) {
           diagnostics.push(makeDiagnostic(field.line,
             `String field '${field.name}' cannot have both size and max_size`));
@@ -562,20 +716,23 @@ function validateDocument(uri: string): void {
         // repeated string: size/max_size AND element_size
         if (!hasSize && !hasMaxSize) {
           diagnostics.push(makeDiagnostic(field.line,
-            `Repeated string field '${field.name}' requires [size=N] or [max_size=N]`));
+            `Repeated string field '${field.name}' requires [size=N] or [max_size=N]`,
+            DiagnosticSeverity.Error, { fix: 'add_size', fieldLine: field.line }));
         } else if (hasSize && hasMaxSize) {
           diagnostics.push(makeDiagnostic(field.line,
             `Repeated string field '${field.name}' cannot have both size and max_size`));
         }
         if (!hasElementSize) {
           diagnostics.push(makeDiagnostic(field.line,
-            `Repeated string field '${field.name}' requires [element_size=M]`));
+            `Repeated string field '${field.name}' requires [element_size=M]`,
+            DiagnosticSeverity.Error, { fix: 'add_element_size', fieldLine: field.line }));
         }
       } else if (field.repeated && PRIMITIVE_TYPES.includes(field.type)) {
         // repeated primitive (array): size or max_size
         if (!hasSize && !hasMaxSize) {
           diagnostics.push(makeDiagnostic(field.line,
-            `Repeated field '${field.name}' requires [size=N] or [max_size=N]`));
+            `Repeated field '${field.name}' requires [size=N] or [max_size=N]`,
+            DiagnosticSeverity.Error, { fix: 'add_size', fieldLine: field.line }));
         } else if (hasSize && hasMaxSize) {
           diagnostics.push(makeDiagnostic(field.line,
             `Repeated field '${field.name}' cannot have both size and max_size`));
@@ -583,6 +740,39 @@ function validateDocument(uri: string): void {
         if (hasElementSize) {
           diagnostics.push(makeDiagnostic(field.line,
             `element_size is only valid on repeated string fields`));
+        }
+      } else if (field.repeated && messageNames.has(field.type)) {
+        // repeated message field: size or max_size
+        if (!hasSize && !hasMaxSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `Repeated message field '${field.name}' requires [size=N] or [max_size=N]`,
+            DiagnosticSeverity.Error, { fix: 'add_size', fieldLine: field.line }));
+        } else if (hasSize && hasMaxSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `Repeated message field '${field.name}' cannot have both size and max_size`));
+        }
+        if (hasElementSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `element_size is only valid on repeated string fields`));
+        }
+      }
+
+      // Validate size and max_size values are positive integers; max_size ≤ 255 for repeated fields
+      if (hasSize) {
+        const sizeVal = parseInt(field.options['size'], 10);
+        if (isNaN(sizeVal) || sizeVal <= 0) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `'size' must be a positive integer, got '${field.options['size']}'`));
+        }
+      }
+      if (hasMaxSize) {
+        const maxSizeVal = parseInt(field.options['max_size'], 10);
+        if (isNaN(maxSizeVal) || maxSizeVal <= 0) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `'max_size' must be a positive integer, got '${field.options['max_size']}'`));
+        } else if (field.repeated && maxSizeVal > 255) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `'max_size' must be ≤ 255 for repeated fields (count prefix is 1 byte), got ${maxSizeVal}`));
         }
       }
 
@@ -609,6 +799,29 @@ function validateDocument(uri: string): void {
     }
   }
 
+  // Enum value number uniqueness
+  for (const enm of parsed.enums) {
+    const valueNumMap = new Map<number, string>();
+    for (const val of enm.values) {
+      if (valueNumMap.has(val.value)) {
+        diagnostics.push(makeDiagnostic(val.line,
+          `Duplicate enum value ${val.value} in '${enm.name}' (already used by '${valueNumMap.get(val.value)}')`));
+      } else {
+        valueNumMap.set(val.value, val.name);
+      }
+    }
+  }
+
+  // Import file existence
+  for (const imp of parsed.imports) {
+    const importUri = resolveImportUri(imp, uri);
+    const importPath = importUri.startsWith('file://') ? fileURLToPath(importUri) : importUri;
+    if (!fs.existsSync(importPath)) {
+      const impLine = parsed.importLines[imp] ?? 0;
+      diagnostics.push(makeDiagnostic(impLine, `Cannot resolve import: '${imp}' not found`));
+    }
+  }
+
   connection.sendDiagnostics({ uri, diagnostics });
 }
 
@@ -629,7 +842,7 @@ function getOrParseDocument(uri: string): ParsedDocument {
       connection.console.log(`getOrParseDocument: read from filesystem '${filePath}'`);
     } catch (err) {
       connection.console.error(`getOrParseDocument: could not read '${uri}': ${err}`);
-      return { uri, packageName: '', imports: [], messages: [], enums: [], fileOptions: {}, fileOptionLines: {} };
+      return { uri, packageName: '', imports: [], importLines: {}, messages: [], enums: [], fileOptions: {}, fileOptionLines: {} };
     }
   }
 
@@ -680,6 +893,47 @@ function getWordAtPosition(text: string, position: Position): { word: string; st
   return { word, start, end };
 }
 
+/**
+ * Text-scan based context detection. Works even when blocks are unclosed (actively being typed).
+ * Uses a keyword-labelled brace stack so it handles oneof/enum/message nesting correctly.
+ */
+function getContextAtLine(text: string, lineNum: number): { inMessage: boolean; inOneof: boolean; inEnum: boolean } {
+  const lines = text.split('\n');
+  const stack: Array<'message' | 'oneof' | 'enum' | 'other'> = [];
+
+  for (let i = 0; i <= lineNum && i < lines.length; i++) {
+    const rawLine = lines[i];
+    const commentIdx = rawLine.indexOf('//');
+    const line = commentIdx >= 0 ? rawLine.substring(0, commentIdx) : rawLine;
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    // Determine the keyword for the first `{` on this line
+    let lineKind: 'message' | 'oneof' | 'enum' | 'other' = 'other';
+    if (/^message\s+/.test(trimmed)) lineKind = 'message';
+    else if (/^oneof\s+/.test(trimmed)) lineKind = 'oneof';
+    else if (/^enum\s+/.test(trimmed)) lineKind = 'enum';
+
+    let lineKindUsed = false;
+    for (const ch of trimmed) {
+      if (ch === '{') {
+        stack.push(!lineKindUsed ? lineKind : 'other');
+        lineKindUsed = true;
+      } else if (ch === '}') {
+        stack.pop();
+      }
+    }
+  }
+
+  // Find the innermost named context
+  const lastSignificant = [...stack].reverse().find(k => k !== 'other');
+  return {
+    inMessage: lastSignificant === 'message',
+    inOneof: lastSignificant === 'oneof',
+    inEnum: lastSignificant === 'enum'
+  };
+}
+
 let hasConfigurationCapability = false;
 let hasWorkspaceFolderCapability = false;
 
@@ -698,7 +952,11 @@ connection.onInitialize((params: InitializeParams) => {
       },
       definitionProvider: true,
       hoverProvider: true,
-      documentSymbolProvider: true
+      documentSymbolProvider: true,
+      codeActionProvider: { codeActionKinds: [CodeActionKind.QuickFix] },
+      foldingRangeProvider: true,
+      referencesProvider: true,
+      workspaceSymbolProvider: true,
     }
   };
 
@@ -784,6 +1042,38 @@ function getCompileConfigCompletionItems(existingDefs: { messages: MessageDefini
   return items;
 }
 
+function getImportPathCompletions(currentUri: string, _typedPath: string): CompletionItem[] {
+  if (!workspaceRoot) return [];
+  const currentDir = path.dirname(currentUri.startsWith('file://') ? fileURLToPath(currentUri) : currentUri);
+  const currentFilePath = currentUri.startsWith('file://') ? fileURLToPath(currentUri) : currentUri;
+  const items: CompletionItem[] = [];
+
+  function scanDir(dir: string, prefix: string) {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+          scanDir(path.join(dir, entry.name), prefix + entry.name + '/');
+        } else if (entry.isFile() && entry.name.endsWith('.sf')) {
+          const absPath = path.join(dir, entry.name);
+          if (absPath !== currentFilePath) {
+            const relPath = prefix + entry.name;
+            items.push({
+              label: relPath,
+              kind: CompletionItemKind.File,
+              detail: '.sf import',
+              insertText: relPath + '"',
+            });
+          }
+        }
+      }
+    } catch { /* ignore unreadable dirs */ }
+  }
+
+  scanDir(currentDir, '');
+  return items;
+}
+
 connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
@@ -792,153 +1082,237 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
   const lines = text.split('\n');
   const lineText = lines[params.position.line] || '';
   const lineUpToCursor = lineText.substring(0, params.position.character);
-  const trimmedUpToCursor = lineUpToCursor.trim();
 
-  // Inside [ ] - field options
+  // ── 0. Inside import "..." string ─────────────────────────────────────
+  const importPathMatch = lineUpToCursor.match(/^\s*import\s+"([^"]*)$/);
+  if (importPathMatch) {
+    return getImportPathCompletions(params.textDocument.uri, importPathMatch[1]);
+  }
+
+  // ── 1. Inside [ ] — field options ───────────────────────────────────────
   const bracketStart = lineUpToCursor.lastIndexOf('[');
   const bracketEnd = lineUpToCursor.lastIndexOf(']');
   if (bracketStart > bracketEnd && bracketStart >= 0) {
     const afterBracket = lineUpToCursor.substring(bracketStart + 1);
-    // Value completion for flatten= (boolean)
+    // Value completion for flatten=
     if (/(?:^|,)\s*(?:(?:sf|struct_frame)\.)?flatten\s*=\s*$/.test(afterBracket)) {
       return [
         { label: 'true', kind: CompletionItemKind.Value },
         { label: 'false', kind: CompletionItemKind.Value }
       ];
     }
-    return FIELD_OPTION_NAMES.map(opt => ({
-      label: opt,
-      kind: CompletionItemKind.Property,
-      detail: 'Field option'
-    }));
+    // Suggest keys only at start of bracket content or after a comma (not after =)
+    if (/(?:^|,)\s*(?:(?:sf|struct_frame)\.)?[a-zA-Z_]*$/.test(afterBracket)) {
+      const FIELD_OPT_COMPLETIONS: Record<string, { detail: string; documentation: string }> = {
+        'size=': { detail: 'Field option', documentation: 'Fixed-size allocation. Strings padded to exactly N bytes; arrays always have exactly N elements. Must be a positive integer.' },
+        'max_size=': { detail: 'Field option', documentation: 'Bounded variable-size. Strings get a length prefix + up to N bytes. Arrays get a count prefix + up to N elements. Must be ≤ 255 for repeated fields.' },
+        'element_size=': { detail: 'Field option', documentation: 'Only for `repeated string` arrays. Size of each individual string element. Must be combined with `size=` or `max_size=`.' },
+        'flatten=': { detail: 'Field option', documentation: 'Only on message-type fields. Inlines the nested message fields directly into the parent. Field names must not collide.' },
+      };
+      // Parse the field declaration before the [ to determine what options are applicable
+      const beforeBracket = lineText.substring(0, bracketStart).trimEnd();
+      const isRepeated = /^\s*repeated\b/.test(lineText);
+      const fieldTypeMatch = beforeBracket.match(/(?:repeated\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*\d+\s*$/);
+      const fieldType = fieldTypeMatch ? fieldTypeMatch[1] : '';
+      const isPrimitiveType = PRIMITIVE_TYPES.includes(fieldType);
+      const isStringType = fieldType === 'string';
+      const isMsgType = !isPrimitiveType && /^[A-Z]/.test(fieldType);
+
+      const applicableOpts = FIELD_OPTION_NAMES.filter(opt => {
+        if (opt === 'element_size=') return isRepeated && isStringType;
+        if (opt === 'flatten=') return !isRepeated && isMsgType;
+        return true; // size= and max_size= always applicable
+      });
+
+      return applicableOpts.map(opt => ({
+        label: opt,
+        kind: CompletionItemKind.Property,
+        detail: FIELD_OPT_COMPLETIONS[opt]?.detail ?? 'Field option',
+        documentation: FIELD_OPT_COMPLETIONS[opt]?.documentation,
+      }));
+    }
+    return [];
   }
 
-  // Context detection for option completion
-  const parsed = getOrParseDocument(params.textDocument.uri);
-  const lineNum = params.position.line;
-  const inOneof = parsed.messages.some(m =>
-    lineNum > m.line && lineNum < m.endLine &&
-    m.oneofs.some(o => lineNum > o.line && lineNum < o.endLine)
-  );
-  const inMessage = !inOneof && parsed.messages.some(m => lineNum > m.line && lineNum < m.endLine);
+  // ── 2. Context detection (stack-based scan, works for unclosed blocks) ──
+  const { inMessage, inOneof, inEnum } = getContextAtLine(text, params.position.line);
 
-  // After "option "
+  // ── 3. option <name> ── suggest context-appropriate option names ─────────
   if (/^\s*option\s+$/.test(lineUpToCursor)) {
-    const optNames = inOneof ? ONEOF_OPTION_NAMES : inMessage ? MESSAGE_OPTION_NAMES : FILE_OPTION_NAMES;
-    return optNames.map(opt => ({
-      label: opt,
-      kind: CompletionItemKind.Property,
-      detail: 'Option name'
-    }));
+    const optNames = inOneof ? ONEOF_OPTION_NAMES
+      : inMessage ? MESSAGE_OPTION_NAMES
+      : FILE_OPTION_NAMES;
+    const OPT_DOCS: Record<string, string> = {
+      pkgid: 'Package identifier (0–255). Enables 16-bit message addressing: `(pkgid << 8) | msgid`.',
+      msgid: 'Unique message identifier (0–255, or 0–65535 with pkgid). Required for top-level routable messages.',
+      variable: 'Enables variable-length encoding. Bounded (`max_size`) fields only transmit used bytes, reducing bandwidth.',
+      is_envelope: 'Marks this message as a container/envelope. Must have exactly one `oneof` whose variants are all message types.',
+      discriminator: 'Controls how the active oneof variant is identified: `"auto"` | `"msgid"` | `"field_order"` | `"none"`.',
+    };
+    return optNames.map(opt => ({ label: opt, kind: CompletionItemKind.Property, detail: 'Option name', documentation: OPT_DOCS[opt] }));
   }
 
-  // After "option discriminator ="
+  // ── 4. option value completions ─────────────────────────────────────────
   if (/^\s*option\s+discriminator\s*=\s*$/.test(lineUpToCursor)) {
     return DISCRIMINATOR_VALUES.map(v => ({
       label: v,
       kind: CompletionItemKind.EnumMember,
       detail: 'Discriminator mode',
-      insertText: `"${v}"`
+      documentation: {
+        auto: 'Default. Uses `msgid` (uint16, 2 bytes) if all variants have msgid; otherwise `field_order` (uint8, 1 byte).',
+        msgid: 'uint16 discriminator set to the message ID of the active variant. All variants must have `msgid`.',
+        field_order: 'uint8 discriminator set to 1-based declaration order. Generates a typed companion enum.',
+        none: 'No discriminator stored (0 bytes). The application must track the active variant out-of-band.',
+      }[v],
+      insertText: v
     }));
   }
-
-  // After "option variable =" or "option is_envelope ="
   if (/^\s*option\s+(variable|is_envelope)\s*=\s*$/.test(lineUpToCursor)) {
     return [
       { label: 'true', kind: CompletionItemKind.Value },
       { label: 'false', kind: CompletionItemKind.Value }
     ];
   }
-
-  // After "option msgid =" or "option pkgid ="
   if (/^\s*option\s+(msgid|pkgid)\s*=\s*$/.test(lineUpToCursor)) {
-    return [{
-      label: '1',
-      kind: CompletionItemKind.Value,
-      detail: 'Numeric option value',
-      documentation: 'Enter a numeric ID'
-    }];
+    const isMsgid = /msgid/.test(lineUpToCursor);
+    if (isMsgid) {
+      const parsedDoc = getOrParseDocument(params.textDocument.uri);
+      const usedIds = new Set(parsedDoc.messages.map(m => parseInt(m.options['msgid'] ?? '-1', 10)).filter(n => !isNaN(n) && n >= 0));
+      let nextFree = 1;
+      while (usedIds.has(nextFree)) nextFree++;
+      return [{ label: String(nextFree), kind: CompletionItemKind.Value, detail: 'Next available msgid' }];
+    }
+    return [{ label: '1', kind: CompletionItemKind.Value, detail: 'Enter a numeric ID' }];
   }
 
-  // At start of line (keywords)
-  if (/^\s*$/.test(trimmedUpToCursor) || trimmedUpToCursor === '') {
-    const items: CompletionItem[] = KEYWORDS.map(kw => ({
-      label: kw,
-      kind: CompletionItemKind.Keyword,
-      detail: 'Keyword'
-    }));
-    return items;
-  }
-
-  // Typing the name of an oneof block — no completions needed
+  // ── 5. Suppress completions while naming a oneof block ──────────────────
   if (/^\s*oneof\s+/.test(lineUpToCursor)) {
     return [];
   }
 
-  const inEnum = parsed.enums.some(e => lineNum > e.line && lineNum < e.endLine);
-
-  if ((inMessage || inOneof) && !inEnum) {
-    const isAfterRepeated = /^\s*repeated\s+$/.test(lineUpToCursor);
-    const isAtTypePosition = /^\s*(repeated\s+)?$/.test(lineUpToCursor) || isAfterRepeated;
-
-    if (isAtTypePosition || /^\s*(repeated\s+)?[a-zA-Z_][a-zA-Z0-9_]*$/.test(lineUpToCursor)) {
-      // Suggest primitive types + user-defined types
-      const allDefs = getAllDefinitions(params.textDocument.uri);
-      const primitiveItems: CompletionItem[] = PRIMITIVE_TYPES.map(t => ({
-        label: t,
-        kind: CompletionItemKind.TypeParameter,
-        detail: 'Primitive type',
-        documentation: PRIMITIVE_TYPE_DOCS[t]
-      }));
-
-      const messageItems: CompletionItem[] = allDefs.messages.map(m => ({
-        label: m.name,
-        kind: CompletionItemKind.Class,
-        detail: 'Message type'
-      }));
-
-      const enumItems: CompletionItem[] = allDefs.enums.map(e => ({
-        label: e.name,
-        kind: CompletionItemKind.Enum,
-        detail: 'Enum type'
-      }));
-
-      return [...primitiveItems, ...messageItems, ...enumItems, ...getCompileConfigCompletionItems(allDefs)];
-    }
-
-    // Inside message/oneof, at start of line - suggest keywords
-    if (/^\s*$/.test(lineUpToCursor)) {
-      const insideMessageKeywords: CompletionItem[] = [
-        { label: 'option', kind: CompletionItemKind.Keyword },
-        { label: 'repeated', kind: CompletionItemKind.Keyword },
-        ...(inMessage && !inOneof ? [{ label: 'oneof', kind: CompletionItemKind.Keyword }] : [])
+  // ── 7. Inside enum ──────────────────────────────────────────────────────
+  if (inEnum) {
+    if (/^\s*[A-Z_]*$/.test(lineUpToCursor)) {
+      return [
+        {
+          label: 'VALUE_NAME = 0;',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Enum value entry',
+          insertText: '${1:VALUE_NAME} = ${2:0};',
+          insertTextFormat: InsertTextFormat.Snippet,
+        }
       ];
-      const allDefs = getAllDefinitions(params.textDocument.uri);
-      const primitiveItems: CompletionItem[] = PRIMITIVE_TYPES.map(t => ({
-        label: t,
-        kind: CompletionItemKind.TypeParameter,
-        detail: 'Primitive type'
-      }));
-      const messageItems: CompletionItem[] = allDefs.messages.map(m => ({
-        label: m.name,
-        kind: CompletionItemKind.Class,
-        detail: 'Message type'
-      }));
-      const enumItems: CompletionItem[] = allDefs.enums.map(e => ({
-        label: e.name,
-        kind: CompletionItemKind.Enum,
-        detail: 'Enum type'
-      }));
-      return [...insideMessageKeywords, ...primitiveItems, ...messageItems, ...enumItems, ...getCompileConfigCompletionItems(allDefs)];
     }
+    return [];
   }
 
-  // Default: suggest keywords
-  return KEYWORDS.map(kw => ({
-    label: kw,
-    kind: CompletionItemKind.Keyword,
-    detail: 'Keyword'
-  }));
+  // ── 7. Inside oneof ──────────────────────────────────────────────────────
+  if (inOneof && !inEnum) {
+    if (/^\s*(repeated\s+)?[a-zA-Z_]*$/.test(lineUpToCursor)) {
+      const allDefs = getAllDefinitions(params.textDocument.uri);
+      return [
+        { label: 'option', kind: CompletionItemKind.Keyword },
+        ...PRIMITIVE_TYPES.map(t => ({
+          label: t, kind: CompletionItemKind.TypeParameter,
+          detail: 'Primitive type', documentation: PRIMITIVE_TYPE_DOCS[t]
+        })),
+        ...allDefs.messages.map(m => ({ label: m.name, kind: CompletionItemKind.Class, detail: 'Message type' })),
+        ...allDefs.enums.map(e => ({ label: e.name, kind: CompletionItemKind.Enum, detail: 'Enum type' })),
+        ...getCompileConfigCompletionItems(allDefs)
+      ];
+    }
+    return [];
+  }
+
+  // ── 8. Inside message (not in oneof) ────────────────────────────────────
+  if (inMessage && !inEnum) {
+    if (/^\s*(repeated\s+)?[a-zA-Z_]*$/.test(lineUpToCursor)) {
+      const allDefs = getAllDefinitions(params.textDocument.uri);
+      return [
+        { label: 'option', kind: CompletionItemKind.Keyword },
+        { label: 'repeated', kind: CompletionItemKind.Keyword },
+        {
+          label: 'oneof',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Oneof union field',
+          insertText: 'oneof ${1:name} {\n  ${2:TypeA} ${3:field_a} = ${4:1};\n  ${5:TypeB} ${6:field_b} = ${7:2};\n}',
+          insertTextFormat: InsertTextFormat.Snippet,
+        },
+        {
+          label: 'enum',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Nested enum definition',
+          insertText: 'enum ${1:EnumName} {\n  ${2:VALUE_A} = 0;\n  ${3:VALUE_B} = 1;\n}',
+          insertTextFormat: InsertTextFormat.Snippet,
+        },
+        {
+          label: 'message',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Nested message definition',
+          insertText: 'message ${1:NestedName} {\n  ${2:uint32} ${3:field_name} = 1;\n}',
+          insertTextFormat: InsertTextFormat.Snippet,
+        },
+        ...PRIMITIVE_TYPES.map(t => ({
+          label: t, kind: CompletionItemKind.TypeParameter,
+          detail: 'Primitive type', documentation: PRIMITIVE_TYPE_DOCS[t]
+        })),
+        ...allDefs.messages.map(m => ({ label: m.name, kind: CompletionItemKind.Class, detail: 'Message type' })),
+        ...allDefs.enums.map(e => ({ label: e.name, kind: CompletionItemKind.Enum, detail: 'Enum type' })),
+        ...getCompileConfigCompletionItems(allDefs)
+      ];
+    }
+    return [];
+  }
+
+  // ── 9. File level ────────────────────────────────────────────────────────
+  if (/^\s*[a-zA-Z_]*$/.test(lineUpToCursor)) {
+    return [
+      {
+        label: 'package',
+        kind: CompletionItemKind.Snippet,
+        detail: 'Package declaration',
+        insertText: 'package ${1:name};',
+        insertTextFormat: InsertTextFormat.Snippet,
+      },
+      {
+        label: 'import',
+        kind: CompletionItemKind.Snippet,
+        detail: 'Import statement',
+        insertText: 'import "${1:path.sf}";',
+        insertTextFormat: InsertTextFormat.Snippet,
+      },
+      {
+        label: 'message',
+        kind: CompletionItemKind.Snippet,
+        detail: 'Message definition',
+        insertText: 'message ${1:MessageName} {\n  option msgid = ${2:1};\n\n  ${3:uint32} ${4:field_name} = 1;\n}',
+        insertTextFormat: InsertTextFormat.Snippet,
+      },
+      {
+        label: 'enum',
+        kind: CompletionItemKind.Snippet,
+        detail: 'Enum definition',
+        insertText: 'enum ${1:EnumName} {\n  ${2:VALUE_A} = 0;\n  ${3:VALUE_B} = 1;\n}',
+        insertTextFormat: InsertTextFormat.Snippet,
+      },
+      {
+        label: 'envelope',
+        kind: CompletionItemKind.Snippet,
+        detail: 'Envelope message pattern',
+        insertText: 'message ${1:PayloadA} {\n  option msgid = ${2:100};\n\n  ${3:uint8} ${4:field} = 1;\n}\n\nmessage ${5:Envelope} {\n  option msgid = ${6:200};\n  option is_envelope = true;\n\n  oneof command {\n    ${1:PayloadA} ${7:payload_a} = 1;\n  }\n}',
+        insertTextFormat: InsertTextFormat.Snippet,
+      },
+      {
+        label: 'option',
+        kind: CompletionItemKind.Snippet,
+        detail: 'File-level option (pkgid)',
+        insertText: 'option pkgid = ${1:1};',
+        insertTextFormat: InsertTextFormat.Snippet,
+      },
+    ];
+  }
+
+  return [];
 });
 
 // Go-to-Definition
@@ -947,6 +1321,22 @@ connection.onDefinition((params: TextDocumentPositionParams): Definition | null 
   if (!doc) {
     connection.console.warn(`onDefinition: document not found: '${params.textDocument.uri}'`);
     return null;
+  }
+
+  const text = doc.getText();
+  const lineText = text.split('\n')[params.position.line] || '';
+
+  // Import path go-to-definition: click inside `import "path.sf"` string
+  {
+    const importMatch = lineText.match(/^\s*import\s+"([^"]+)"/);
+    if (importMatch) {
+      const quoteStart = lineText.indexOf('"');
+      const quoteEnd = lineText.lastIndexOf('"');
+      if (params.position.character > quoteStart && params.position.character <= quoteEnd) {
+        const importUri = resolveImportUri(importMatch[1], params.textDocument.uri);
+        return Location.create(importUri, Range.create(0, 0, 0, 0));
+      }
+    }
   }
 
   const wordInfo = getWordAtPosition(doc.getText(), params.position);
@@ -1016,8 +1406,6 @@ connection.onDefinition((params: TextDocumentPositionParams): Definition | null 
   const sfLocation = findDefinition(params.textDocument.uri);
 
   // Determine context: are we on the declaration line itself, or referencing a type in a field?
-  const text = doc.getText();
-  const lineText = text.split('\n')[params.position.line] || '';
   const isDeclaration = new RegExp(`^\\s*(message|enum)\\s+${word}\\b`).test(lineText);
 
   if (isDeclaration) {
@@ -1180,6 +1568,82 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
 
   const { word } = wordInfo;
 
+  // Import path hover: hovering inside `import "path.sf"` string
+  {
+    const lineText = doc.getText().split('\n')[params.position.line] || '';
+    const importMatch = lineText.match(/^\s*import\s+"([^"]+)"/);
+    if (importMatch) {
+      const quoteStart = lineText.indexOf('"');
+      const quoteEnd = lineText.lastIndexOf('"');
+      if (params.position.character > quoteStart && params.position.character <= quoteEnd) {
+        const importPath = importMatch[1];
+        const importUri = resolveImportUri(importPath, params.textDocument.uri);
+        try {
+          const importedDoc = getOrParseDocument(importUri);
+          const msgList = importedDoc.messages.map(m => `- **message** \`${m.name}\``).join('\n');
+          const enumList = importedDoc.enums.map(e => `- **enum** \`${e.name}\``).join('\n');
+          const pkgLine = importedDoc.packageName ? `**package** \`${importedDoc.packageName}\`\n\n` : '';
+          const body = [msgList, enumList].filter(Boolean).join('\n') || '*No top-level messages or enums*';
+          return { contents: { kind: MarkupKind.Markdown, value: `${pkgLine}**\`${importPath}\`**\n\n${body}` } };
+        } catch {
+          return { contents: { kind: MarkupKind.Markdown, value: `Import: \`${importPath}\`` } };
+        }
+      }
+    }
+  }
+
+  // Option name hover (e.g. hovering over `msgid` in `option msgid = 1;`)
+  {
+    const lineText = doc.getText().split('\n')[params.position.line] || '';
+    const optMatch = lineText.match(/^\s*option\s+(\w+)\s*=/);
+    if (optMatch && word === optMatch[1]) {
+      const OPT_DOCS: Record<string, string> = {
+        pkgid: '**pkgid** *(file option)*\n\nPackage identifier (0–255). Enables 16-bit addressing: `(pkgid << 8) | msgid`, allowing 256 packages × 256 messages = 65,536 unique IDs.',
+        msgid: '**msgid** *(message option)*\n\nUnique message identifier for routing and deserialization (0–255 without pkgid, 0–65535 with pkgid). Required on most messages.',
+        variable: '**variable** *(message option)*\n\nEnables variable-length encoding. Bounded fields (`max_size`) transmit only actual bytes instead of full allocated size.',
+        is_envelope: '**is_envelope** *(message option)*\n\nMarks message as a container/wrapper. Must have exactly one `oneof` field whose variants are all message types.',
+        discriminator: '**discriminator** *(oneof option)*\n\nControls how the oneof variant is identified during deserialization:\n- `"auto"` — uses `msgid` if all variants have one, otherwise `field_order`\n- `"msgid"` — uint16 discriminator by message ID\n- `"field_order"` — uint8 1-based field index; generates a companion enum\n- `"none"` — no discriminator stored; caller handles disambiguation manually'
+      };
+      if (OPT_DOCS[word]) {
+        return { contents: { kind: MarkupKind.Markdown, value: OPT_DOCS[word] } };
+      }
+    }
+  }
+
+  // Discriminator value hover (e.g. hovering over "auto" in `option discriminator = "auto";`)
+  {
+    const lineText = doc.getText().split('\n')[params.position.line] || '';
+    if (/option\s+discriminator\s*=/.test(lineText)) {
+      const DISC_DOCS: Record<string, string> = {
+        auto: '**auto** *(discriminator mode)*\n\nDefault mode. Uses `msgid` (uint16, 2 bytes) if all oneof variants are messages with `msgid`; otherwise falls back to `field_order` (uint8, 1 byte).',
+        msgid: '**msgid** *(discriminator mode)*\n\nUses the message ID as the discriminator value. Generates a `uint16` (2-byte) prefix. All oneof variants must be messages with `msgid`. Error if any variant lacks one.',
+        field_order: '**field_order** *(discriminator mode)*\n\nUses 1-based declaration order as the discriminator. Generates a `uint8` (1-byte) prefix and a typed companion enum `{MessageName}{OneofName}Field` with one entry per variant.',
+        none: '**none** *(discriminator mode)*\n\nNo discriminator field is generated (0 bytes of overhead). The application must track which variant is active out-of-band. Reduces message size at the cost of type safety.',
+      };
+      if (DISC_DOCS[word]) {
+        return { contents: { kind: MarkupKind.Markdown, value: DISC_DOCS[word] } };
+      }
+    }
+  }
+
+  // Field option name hover (e.g. hovering over `size` inside `[size=16]`)
+  {
+    const lineText = doc.getText().split('\n')[params.position.line] || '';
+    const bracketStart = lineText.lastIndexOf('[', params.position.character);
+    const bracketEnd = lineText.indexOf(']', params.position.character);
+    if (bracketStart >= 0 && (bracketEnd < 0 || bracketEnd > bracketStart)) {
+      const FIELD_OPT_DOCS: Record<string, string> = {
+        size: '**size=N** *(field option)*\n\nFixed-size allocation (1–65535). Strings are padded to exactly N bytes; arrays always contain exactly N elements.',
+        max_size: '**max_size=N** *(field option)*\n\nBounded variable-size (1–65535). Strings get a 1–2 byte length prefix + up to N chars. Arrays get a count prefix + up to N elements.',
+        element_size: '**element_size=M** *(field option)*\n\nSize of each string in a `repeated string` array (1–65535). Must be combined with `size` or `max_size`.',
+        flatten: '**flatten=true** *(field option)*\n\nOnly on message-type fields. Inlines the nested message\'s fields directly into the parent struct. Field names must not collide with the parent\'s existing fields.'
+      };
+      if (FIELD_OPT_DOCS[word]) {
+        return { contents: { kind: MarkupKind.Markdown, value: FIELD_OPT_DOCS[word] } };
+      }
+    }
+  }
+
   // Primitive type hover
   if (PRIMITIVE_TYPES.includes(word)) {
     return {
@@ -1211,10 +1675,12 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
         };
       }
       const fieldLines = msg.fields.map(f => `  ${f.repeated ? 'repeated ' : ''}${f.type} ${f.name} = ${f.tag};`).join('\n');
+      const optLines = Object.entries(msg.options).map(([k, v]) => `  option ${k} = ${v};`).join('\n');
+      const body = [optLines, fieldLines].filter(Boolean).join('\n');
       return {
         contents: {
           kind: MarkupKind.Markdown,
-          value: `**message ${word}**\n\`\`\`sf\nmessage ${word} {\n${fieldLines}\n}\n\`\`\`${generatedSection}`
+          value: `**message ${word}**\n\`\`\`sf\nmessage ${word} {\n${body}\n}\n\`\`\`${generatedSection}`
         }
       };
     }
@@ -1331,6 +1797,52 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
     }
   }
 
+  // Field name hover — show type, tag, and options inline
+  {
+    const lineText = doc.getText().split('\n')[params.position.line] || '';
+    const fieldMatch = lineText.match(
+      /^(\s*)(repeated\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([0-9]+)\s*(?:\[([^\]]*)\])?\s*;/
+    );
+    if (fieldMatch && word === fieldMatch[4]) {
+      const repeated = !!fieldMatch[2];
+      const type = fieldMatch[3];
+      const tag = fieldMatch[5];
+      const opts = fieldMatch[6] ? `  // [${fieldMatch[6]}]` : '';
+      const typeLabel = repeated ? `repeated ${type}` : type;
+      const sizeNotes: string[] = [];
+      if (fieldMatch[6]) {
+        const parsedOpts = parseFieldOptions(fieldMatch[6]);
+        if (parsedOpts['size']) sizeNotes.push(`fixed size: **${parsedOpts['size']}** bytes/elements`);
+        if (parsedOpts['max_size']) sizeNotes.push(`max size: **${parsedOpts['max_size']}** (+ count prefix)`);
+        if (parsedOpts['element_size']) sizeNotes.push(`element size: **${parsedOpts['element_size']}** bytes each`);
+        if (parsedOpts['flatten'] === 'true') sizeNotes.push('fields flattened into parent');
+      }
+      const notes = sizeNotes.length ? `\n\n${sizeNotes.map(n => `- ${n}`).join('\n')}` : '';
+      return {
+        contents: {
+          kind: MarkupKind.Markdown,
+          value: `**${word}** *(field)*\n\`\`\`sf\n${typeLabel} ${word} = ${tag};${opts}\n\`\`\`${notes}`
+        }
+      };
+    }
+  }
+
+  // Keyword hover — brief docs for language keywords
+  {
+    const KEYWORD_DOCS: Record<string, string> = {
+      package: '**package** *(keyword)*\n\nDeclares the namespace for all messages/enums in this file. Used as a prefix or namespace in generated code.\n\n```sf\npackage sensor_data;\n```',
+      import: '**import** *(keyword)*\n\nIncludes types from another `.sf` file. Imported message and enum types can be used as field types.\n\n```sf\nimport "types.sf";\n```',
+      message: '**message** *(keyword)*\n\nDefines a fixed-size packed struct. Requires `option msgid` for top-level routable messages. Fields must have unique field numbers.\n\n```sf\nmessage Heartbeat {\n  option msgid = 1;\n  uint64 timestamp = 1;\n}\n```',
+      enum: '**enum** *(keyword)*\n\nDefines an enumeration stored as `uint8` (1 byte). Values must be unique within the enum. Can be defined at file level or nested inside a message.\n\n```sf\nenum State { IDLE = 0; RUNNING = 1; }\n```',
+      repeated: '**repeated** *(keyword)*\n\nDeclares an array field. Must specify `[size=N]` (fixed) or `[max_size=N]` (variable, max 255 elements). Repeated string arrays also need `[element_size=M]`.',
+      oneof: '**oneof** *(keyword)*\n\nDeclares a union field where only one variant is active at a time. All variants share the same memory (size of largest type). Generates an auto-discriminator field.',
+      option: '**option** *(keyword)*\n\nSets a message, oneof, or file-level option. Common options: `msgid`, `pkgid`, `variable`, `is_envelope`, `discriminator`.',
+    };
+    if (KEYWORD_DOCS[word]) {
+      return { contents: { kind: MarkupKind.Markdown, value: KEYWORD_DOCS[word] } };
+    }
+  }
+
   return null;
 });
 
@@ -1345,18 +1857,33 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
   const msgSymbolMap = new Map<string, DocumentSymbol>();
   for (const msg of parsed.messages) {
     const msgRange = Range.create(msg.line, 0, msg.endLine + 1, 0);
+    const fieldSymbols: DocumentSymbol[] = msg.fields.map(f => ({
+      name: f.name,
+      detail: `${f.repeated ? 'repeated ' : ''}${f.type}`,
+      kind: SymbolKind.Field,
+      range: Range.create(f.line, 0, f.line + 1, 0),
+      selectionRange: Range.create(f.line, 0, f.line, f.name.length)
+    }));
+    const oneofSymbols: DocumentSymbol[] = msg.oneofs.map(o => ({
+      name: o.name,
+      detail: 'oneof',
+      kind: SymbolKind.Namespace,
+      range: Range.create(o.line, 0, o.endLine + 1, 0),
+      selectionRange: Range.create(o.line, 0, o.line, o.name.length),
+      children: o.fields.map(f => ({
+        name: f.name,
+        detail: f.type,
+        kind: SymbolKind.Field,
+        range: Range.create(f.line, 0, f.line + 1, 0),
+        selectionRange: Range.create(f.line, 0, f.line, f.name.length)
+      }))
+    }));
     const msgSymbol: DocumentSymbol = {
       name: msg.name,
       kind: SymbolKind.Class,
       range: msgRange,
       selectionRange: Range.create(msg.line, 0, msg.line, msg.name.length + 8),
-      children: msg.fields.map(f => ({
-        name: f.name,
-        detail: `${f.repeated ? 'repeated ' : ''}${f.type}`,
-        kind: SymbolKind.Field,
-        range: Range.create(f.line, 0, f.line + 1, 0),
-        selectionRange: Range.create(f.line, 0, f.line, f.name.length)
-      }))
+      children: [...fieldSymbols, ...oneofSymbols]
     };
     msgSymbolMap.set(msg.name, msgSymbol);
     symbols.push(msgSymbol);
@@ -1388,6 +1915,252 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
   }
 
   return symbols;
+});
+
+// ── Code Actions (Quick-Fixes) ─────────────────────────────────────────────
+connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+
+  const actions: CodeAction[] = [];
+
+  for (const diag of params.context.diagnostics) {
+    if (diag.source !== 'struct-frame') continue;
+    const data = diag.data as Record<string, unknown> | undefined;
+    if (!data) continue;
+
+    const lineNum = diag.range.start.line;
+    const lineText = doc.getText().split('\n')[lineNum] ?? '';
+
+    if (data.fix === 'add_size') {
+      // Strip semicolon from end so we can append before it
+      const trimmedLine = lineText.trimEnd();
+      const hasSemicolon = trimmedLine.endsWith(';');
+      const insertPos = hasSemicolon
+        ? Position.create(lineNum, trimmedLine.length - 1)
+        : Position.create(lineNum, trimmedLine.length);
+
+      for (const [label, snippet] of [
+        ['Add [size=16]', ' [size=16]'],
+        ['Add [max_size=64]', ' [max_size=64]'],
+      ] as [string, string][]) {
+        const edit: WorkspaceEdit = {
+          changes: {
+            [params.textDocument.uri]: [
+              TextEdit.insert(insertPos, snippet)
+            ]
+          }
+        };
+        actions.push({
+          title: label,
+          kind: CodeActionKind.QuickFix,
+          diagnostics: [diag],
+          edit,
+        });
+      }
+    }
+
+    if (data.fix === 'add_element_size') {
+      // Field already has [size=...] or [max_size=...]; insert element_size after it
+      const closingBracket = lineText.lastIndexOf(']');
+      if (closingBracket >= 0) {
+        const insertPos = Position.create(lineNum, closingBracket);
+        const edit: WorkspaceEdit = {
+          changes: {
+            [params.textDocument.uri]: [
+              TextEdit.insert(insertPos, ', element_size=32')
+            ]
+          }
+        };
+        actions.push({
+          title: 'Add [element_size=32]',
+          kind: CodeActionKind.QuickFix,
+          diagnostics: [diag],
+          edit,
+        });
+      } else {
+        // No bracket at all — append before semicolon
+        const trimmedLine = lineText.trimEnd();
+        const insertPos = trimmedLine.endsWith(';')
+          ? Position.create(lineNum, trimmedLine.length - 1)
+          : Position.create(lineNum, trimmedLine.length);
+        const edit: WorkspaceEdit = {
+          changes: {
+            [params.textDocument.uri]: [
+              TextEdit.insert(insertPos, ' [element_size=32]')
+            ]
+          }
+        };
+        actions.push({
+          title: 'Add [element_size=32]',
+          kind: CodeActionKind.QuickFix,
+          diagnostics: [diag],
+          edit,
+        });
+      }
+    }
+  }
+
+  return actions;
+});
+
+// ── Folding Ranges ─────────────────────────────────────────────────────────
+connection.onFoldingRanges((params) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+
+  const parsed = getOrParseDocument(params.textDocument.uri);
+  const ranges: FoldingRange[] = [];
+
+  for (const msg of parsed.messages) {
+    if (msg.endLine > msg.line) {
+      ranges.push(FoldingRange.create(msg.line, msg.endLine, undefined, undefined, FoldingRangeKind.Region));
+    }
+    for (const oneof of msg.oneofs) {
+      if (oneof.endLine > oneof.line) {
+        ranges.push(FoldingRange.create(oneof.line, oneof.endLine, undefined, undefined, FoldingRangeKind.Region));
+      }
+    }
+    for (const nm of msg.nestedMessages) {
+      if (nm.endLine > nm.line) {
+        ranges.push(FoldingRange.create(nm.line, nm.endLine, undefined, undefined, FoldingRangeKind.Region));
+      }
+    }
+  }
+
+  for (const enm of parsed.enums) {
+    if (enm.endLine > enm.line) {
+      ranges.push(FoldingRange.create(enm.line, enm.endLine, undefined, undefined, FoldingRangeKind.Region));
+    }
+  }
+
+  // Block comments
+  const text = doc.getText();
+  const blockCommentRe = /\/\*[\s\S]*?\*\//g;
+  let match: RegExpExecArray | null;
+  while ((match = blockCommentRe.exec(text)) !== null) {
+    const startLine = doc.positionAt(match.index).line;
+    const endLine = doc.positionAt(match.index + match[0].length).line;
+    if (endLine > startLine) {
+      ranges.push(FoldingRange.create(startLine, endLine, undefined, undefined, FoldingRangeKind.Comment));
+    }
+  }
+
+  return ranges;
+});
+
+// ── Find References ────────────────────────────────────────────────────────
+connection.onReferences((params) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+
+  const wordInfo = getWordAtPosition(doc.getText(), params.position);
+  if (!wordInfo || !/^[A-Z]/.test(wordInfo.word)) return [];
+  const targetName = wordInfo.word;
+
+  // Collect all open .sf documents + any referenced via compile config
+  const urisToSearch = new Set<string>([params.textDocument.uri]);
+  for (const [uri] of parsedDocuments) {
+    if (uri.endsWith('.sf')) urisToSearch.add(uri);
+  }
+  if (sfCompileConfig) {
+    const sourceDir = getCompileConfigSourceDir();
+    const allEntries = [...sfCompileConfig.messages, ...(sfCompileConfig.nested_messages ?? []), ...sfCompileConfig.enums];
+    for (const entry of allEntries) {
+      if (entry.source_file) {
+        const absPath = path.resolve(sourceDir, entry.source_file);
+        if (fs.existsSync(absPath)) urisToSearch.add(pathToFileURL(absPath).toString());
+      }
+    }
+  }
+
+  const locations: Location[] = [];
+  const fieldTypeRe = new RegExp(`\\b${targetName}\\b`);
+
+  for (const uri of urisToSearch) {
+    const parsed = getOrParseDocument(uri);
+    for (const msg of parsed.messages) {
+      for (const field of msg.fields) {
+        if (field.type === targetName) {
+          locations.push(Location.create(uri, Range.create(field.line, 0, field.line, 10000)));
+        }
+      }
+      for (const oneof of msg.oneofs) {
+        for (const field of oneof.fields) {
+          if (field.type === targetName) {
+            locations.push(Location.create(uri, Range.create(field.line, 0, field.line, 10000)));
+          }
+        }
+      }
+      for (const nm of msg.nestedMessages) {
+        for (const field of nm.fields) {
+          if (field.type === targetName) {
+            locations.push(Location.create(uri, Range.create(field.line, 0, field.line, 10000)));
+          }
+        }
+      }
+    }
+  }
+
+  return locations;
+});
+
+// ── Workspace Symbols ──────────────────────────────────────────────────────
+connection.onWorkspaceSymbol((params) => {
+  const query = params.query.toLowerCase();
+  const results: SymbolInformation[] = [];
+
+  // Collect from all parsed documents + compile config source files
+  const urisToSearch = new Set<string>();
+  for (const [uri] of parsedDocuments) {
+    if (uri.endsWith('.sf')) urisToSearch.add(uri);
+  }
+  if (sfCompileConfig && workspaceRoot) {
+    const sourceDir = getCompileConfigSourceDir();
+    const allEntries = [...sfCompileConfig.messages, ...(sfCompileConfig.nested_messages ?? []), ...sfCompileConfig.enums];
+    for (const entry of allEntries) {
+      if (entry.source_file) {
+        const absPath = path.resolve(sourceDir, entry.source_file);
+        if (fs.existsSync(absPath)) urisToSearch.add(pathToFileURL(absPath).toString());
+      }
+    }
+  }
+
+  for (const uri of urisToSearch) {
+    const parsed = getOrParseDocument(uri);
+    for (const msg of parsed.messages) {
+      if (!query || msg.name.toLowerCase().includes(query)) {
+        results.push({
+          name: msg.name,
+          kind: SymbolKind.Class,
+          location: Location.create(uri, Range.create(msg.line, 0, msg.endLine + 1, 0)),
+          containerName: parsed.packageName || undefined,
+        });
+      }
+      for (const nm of msg.nestedMessages) {
+        if (!query || nm.name.toLowerCase().includes(query)) {
+          results.push({
+            name: nm.name,
+            kind: SymbolKind.Class,
+            location: Location.create(uri, Range.create(nm.line, 0, nm.endLine + 1, 0)),
+            containerName: msg.name,
+          });
+        }
+      }
+    }
+    for (const enm of parsed.enums) {
+      if (!query || enm.name.toLowerCase().includes(query)) {
+        results.push({
+          name: enm.name,
+          kind: SymbolKind.Enum,
+          location: Location.create(uri, Range.create(enm.line, 0, enm.endLine + 1, 0)),
+          containerName: enm.parentMessage ?? parsed.packageName ?? undefined,
+        });
+      }
+    }
+  }
+
+  return results;
 });
 
 documents.listen(connection);
