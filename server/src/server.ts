@@ -29,6 +29,7 @@ import {
   WorkspaceEdit,
   FoldingRange,
   FoldingRangeKind,
+  RenameParams,
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
@@ -92,6 +93,9 @@ interface ParsedDocument {
 }
 
 const parsedDocuments = new Map<string, ParsedDocument>();
+// Cache for import-path completions: key=directory -> items
+// Cleared whenever a .sf file in that directory changes.
+const importScanCache = new Map<string, CompletionItem[]>();
 
 // --- sf_compile.json support ---
 
@@ -577,8 +581,14 @@ function validateDocument(uri: string): void {
     if (msgidStr !== undefined) {
       const msgid = parseInt(msgidStr, 10);
       const optLine = msg.optionLines['msgid'] ?? msg.line;
-      if (isNaN(msgid) || msgid < 0 || msgid > maxMsgid) {
-        diagnostics.push(makeDiagnostic(optLine, `msgid must be 0–${maxMsgid}, got '${msgidStr}'`));
+      if (isNaN(msgid) || msgid < 0 || msgid > 65535) {
+        diagnostics.push(makeDiagnostic(optLine, `msgid must be 0–65535, got '${msgidStr}'`));
+      } else if (!hasPkgid && msgid > 255) {
+        diagnostics.push(makeDiagnostic(optLine,
+          `msgid ${msgid} exceeds 255; add 'option pkgid' at file level to enable 16-bit message IDs (0–65535)`,
+          DiagnosticSeverity.Error,
+          { fix: 'add_pkgid' }
+        ));
       } else if (msgidMap.has(msgid)) {
         diagnostics.push(makeDiagnostic(optLine,
           `Duplicate msgid ${msgid} (already used by '${msgidMap.get(msgid)}')`));
@@ -635,6 +645,19 @@ function validateDocument(uri: string): void {
           msg.optionLines['variable'] ?? msg.line,
           `option variable=true has no effect: no fields use [max_size=N] in '${msg.name}'`,
           DiagnosticSeverity.Warning
+        ));
+      }
+    }
+    // Suggest variable=true when max_size fields are present but the option is not set
+    if (msg.options['variable'] === undefined) {
+      const allFields = [...msg.fields, ...msg.oneofs.flatMap(o => o.fields)];
+      const hasMaxSizeField = allFields.some(f => 'max_size' in f.options);
+      if (hasMaxSizeField) {
+        diagnostics.push(makeDiagnostic(
+          msg.line,
+          `Message '${msg.name}' has max_size field(s); add 'option variable = true' to enable variable-length encoding`,
+          DiagnosticSeverity.Information,
+          { fix: 'add_variable_true', msgLine: msg.line }
         ));
       }
     }
@@ -771,22 +794,30 @@ function validateDocument(uri: string): void {
         }
       }
 
-      // Validate size and max_size values are positive integers (1–65535)
+      // Validate size/max_size/element_size are in range 1–65535
       if (hasSize) {
         const sizeVal = parseInt(field.options['size'], 10);
-        if (isNaN(sizeVal) || sizeVal <= 0) {
+        if (isNaN(sizeVal) || sizeVal < 1 || sizeVal > 65535) {
           diagnostics.push(makeDiagnostic(field.line,
-            `'size' must be a positive integer, got '${field.options['size']}'`));
+            `'size' must be 1–65535, got '${field.options['size']}'`));
         }
       }
       if (hasMaxSize) {
         const maxSizeVal = parseInt(field.options['max_size'], 10);
-        if (isNaN(maxSizeVal) || maxSizeVal <= 0) {
+        if (isNaN(maxSizeVal) || maxSizeVal < 1 || maxSizeVal > 65535) {
           diagnostics.push(makeDiagnostic(field.line,
-            `'max_size' must be a positive integer, got '${field.options['max_size']}'`));
-        } else if (maxSizeVal > 65535) {
+            `'max_size' must be 1–65535, got '${field.options['max_size']}'`));
+        } else if (maxSizeVal > 255) {
           diagnostics.push(makeDiagnostic(field.line,
-            `'max_size' must be ≤ 65535, got ${maxSizeVal}`));
+            `max_size=${maxSizeVal} > 255: count/length prefix will be uint16 (2 bytes) instead of uint8 (1 byte)`,
+            DiagnosticSeverity.Information));
+        }
+      }
+      if (hasElementSize) {
+        const elementSizeVal = parseInt(field.options['element_size'], 10);
+        if (isNaN(elementSizeVal) || elementSizeVal < 1 || elementSizeVal > 65535) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `'element_size' must be 1–65535, got '${field.options['element_size']}'`));
         }
       }
 
@@ -974,6 +1005,7 @@ connection.onInitialize((params: InitializeParams) => {
       foldingRangeProvider: true,
       referencesProvider: true,
       workspaceSymbolProvider: true,
+      renameProvider: { prepareProvider: true },
     }
   };
 
@@ -1012,15 +1044,17 @@ connection.onDidChangeWatchedFiles(params => {
     if (change.uri.endsWith('sf_compile.json')) {
       loadSfCompileConfig();
     }
-    if (change.type === FileChangeType.Deleted) {
-      parsedDocuments.delete(change.uri);
-    } else {
-      parsedDocuments.delete(change.uri);
+    if (change.uri.endsWith('.sf')) {
+      const changedPath = change.uri.startsWith('file://') ? fileURLToPath(change.uri) : change.uri;
+      importScanCache.delete(path.dirname(changedPath));
     }
+    parsedDocuments.delete(change.uri);
   }
 });
 
 documents.onDidChangeContent(change => {
+  const changedPath = change.document.uri.startsWith('file://') ? fileURLToPath(change.document.uri) : change.document.uri;
+  importScanCache.delete(path.dirname(changedPath));
   parsedDocuments.delete(change.document.uri);
   validateDocument(change.document.uri);
 });
@@ -1061,19 +1095,19 @@ function getCompileConfigCompletionItems(existingDefs: { messages: MessageDefini
 
 function getImportPathCompletions(currentUri: string, _typedPath: string): CompletionItem[] {
   if (!workspaceRoot) return [];
-  const currentDir = path.dirname(currentUri.startsWith('file://') ? fileURLToPath(currentUri) : currentUri);
   const currentFilePath = currentUri.startsWith('file://') ? fileURLToPath(currentUri) : currentUri;
-  const items: CompletionItem[] = [];
+  const currentDir = path.dirname(currentFilePath);
+  const currentBasename = path.basename(currentFilePath);
 
-  function scanDir(dir: string, prefix: string) {
-    try {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
-          scanDir(path.join(dir, entry.name), prefix + entry.name + '/');
-        } else if (entry.isFile() && entry.name.endsWith('.sf')) {
-          const absPath = path.join(dir, entry.name);
-          if (absPath !== currentFilePath) {
+  if (!importScanCache.has(currentDir)) {
+    const items: CompletionItem[] = [];
+    const scan = (dir: string, prefix: string) => {
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+            scan(path.join(dir, entry.name), prefix + entry.name + '/');
+          } else if (entry.isFile() && entry.name.endsWith('.sf')) {
             const relPath = prefix + entry.name;
             items.push({
               label: relPath,
@@ -1083,12 +1117,14 @@ function getImportPathCompletions(currentUri: string, _typedPath: string): Compl
             });
           }
         }
-      }
-    } catch { /* ignore unreadable dirs */ }
+      } catch { /* ignore unreadable dirs */ }
+    };
+    scan(currentDir, '');
+    importScanCache.set(currentDir, items);
   }
 
-  scanDir(currentDir, '');
-  return items;
+  const cached = importScanCache.get(currentDir)!;
+  return cached.filter(item => item.insertText !== currentBasename + '"');
 }
 
 connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] => {
@@ -1121,10 +1157,10 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
     // Suggest keys only at start of bracket content or after a comma (not after =)
     if (/(?:^|,)\s*(?:(?:sf|struct_frame)\.)?[a-zA-Z_]*$/.test(afterBracket)) {
       const FIELD_OPT_COMPLETIONS: Record<string, { detail: string; documentation: string }> = {
-        'size=': { detail: 'Field option', documentation: 'Fixed-size allocation. Strings padded to exactly N bytes; arrays always have exactly N elements. Must be a positive integer.' },
-        'max_size=': { detail: 'Field option', documentation: 'Bounded variable-size (1–65535). Strings get a length prefix + up to N bytes. Arrays get a count prefix + up to N elements. Uses a 1-byte (uint8) count prefix if max_size ≤ 255, or a 2-byte (uint16) count prefix if max_size > 255.' },
-        'element_size=': { detail: 'Field option', documentation: 'Only for `repeated string` arrays. Size of each individual string element. Must be combined with `size=` or `max_size=`.' },
-        'flatten=': { detail: 'Field option', documentation: 'Only on message-type fields. Inlines the nested message fields directly into the parent. Field names must not collide.' },
+        'size=': { detail: 'Field option', documentation: 'Fixed-size allocation (1–65535). Strings padded to exactly N bytes (null-padded); arrays always have exactly N elements. No count prefix — uses exactly N × element_bytes.' },
+        'max_size=': { detail: 'Field option', documentation: 'Bounded variable-size (1–65535). Strings: length prefix + up to N bytes. Arrays: count prefix + up to N elements. Count prefix is uint8 (1 byte) when N ≤ 255, uint16 (2 bytes) when N > 255.' },
+        'element_size=': { detail: 'Field option', documentation: 'Only for `repeated string` arrays (1–65535). Size in bytes reserved for each string element. Must be combined with `size=` or `max_size=`.' },
+        'flatten=': { detail: 'Field option', documentation: 'Only on message-type fields. Inlines the nested message fields directly into the parent. Field names must not collide. Affects Python and GraphQL output only; no effect on C, C++, C#, TypeScript, or Rust.' },
       };
       // Parse the field declaration before the [ to determine what options are applicable
       const beforeBracket = lineText.substring(0, bracketStart).trimEnd();
@@ -1383,6 +1419,14 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
           detail: 'Nested message definition',
           insertText: 'message ${1:NestedName} {\n  ${2:uint32} ${3:field_name} = 1;\n}',
           insertTextFormat: InsertTextFormat.Snippet,
+        },
+        {
+          label: 'flatten field',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Inline nested message fields into parent (flatten=true)',
+          insertText: '${1:MessageType} ${2:field_name} = ${3:1} [flatten=true];',
+          insertTextFormat: InsertTextFormat.Snippet,
+          documentation: 'Inlines the fields of a nested message directly into this message. Field names must not collide with existing parent fields.\n\nNote: affects Python and GraphQL output only; no effect on C, C++, C#, TypeScript, or Rust.',
         },
         ...PRIMITIVE_TYPES.map(t => ({
           label: t, kind: CompletionItemKind.TypeParameter,
@@ -1786,10 +1830,10 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
     const bracketEnd = lineText.indexOf(']', params.position.character);
     if (bracketStart >= 0 && (bracketEnd < 0 || bracketEnd > bracketStart)) {
       const FIELD_OPT_DOCS: Record<string, string> = {
-        size: '**size=N** *(field option)*\n\nFixed-size allocation (1–65535). Strings are padded to exactly N bytes; arrays always contain exactly N elements.',
-        max_size: '**max_size=N** *(field option)*\n\nBounded variable-size (1–65535). Strings get a 1–2 byte length prefix + up to N chars. Arrays get a count prefix + up to N elements — uses a 1-byte (`uint8`) count if N ≤ 255, or a 2-byte (`uint16`) count if N > 255.',
-        element_size: '**element_size=M** *(field option)*\n\nSize of each string in a `repeated string` array (1–65535). Must be combined with `size` or `max_size`.',
-        flatten: '**flatten=true** *(field option)*\n\nOnly on message-type fields. Inlines the nested message\'s fields directly into the parent struct. Field names must not collide with the parent\'s existing fields.'
+        size: '**size=N** *(field option)*\n\nFixed-size allocation (1–65535). Strings are padded to exactly N bytes (null-padded); arrays always contain exactly N elements.\n\nByte layout: no count/length prefix — the data occupies exactly `N × element_bytes` bytes.',
+        max_size: '**max_size=N** *(field option)*\n\nBounded variable-size (1–65535). Strings get a length prefix + up to N chars. Arrays get a count prefix + up to N elements.\n\nCount prefix size: **`uint8` (1 byte)** when `N ≤ 255`, or **`uint16` (2 bytes)** when `N > 255`.',
+        element_size: '**element_size=M** *(field option)*\n\nSize in bytes of each string element in a `repeated string` array (1–65535). Required alongside `size` or `max_size`. Each string slot reserves exactly M bytes.',
+        flatten: '**flatten=true** *(field option)*\n\nOnly on message-type fields. Inlines the nested message\'s fields directly into the parent struct. Field names must not collide with the parent\'s existing fields.\n\n> **Note**: affects Python and GraphQL output only; has no effect on C, C++, C#, TypeScript, or Rust generated code.'
       };
       if (FIELD_OPT_DOCS[word]) {
         return { contents: { kind: MarkupKind.Markdown, value: FIELD_OPT_DOCS[word] } };
@@ -2210,6 +2254,58 @@ connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
         }
       }
     }
+
+    if (data.fix === 'add_pkgid') {
+      // Insert `option pkgid = 1;` at file level — after the last package/option line,
+      // or at the top of the file if no such line exists.
+      const lines = doc.getText().split('\n');
+      let insertAfter = -1;
+      for (let i = 0; i < lines.length; i++) {
+        const t = lines[i].trim();
+        if (/^package\s+/.test(t) || /^option\s+/.test(t)) insertAfter = i;
+        if (/^message\s+|^enum\s+/.test(t)) break;
+      }
+      const edit: WorkspaceEdit = {
+        changes: {
+          [params.textDocument.uri]: [
+            TextEdit.insert(Position.create(insertAfter + 1, 0), 'option pkgid = 1;\n')
+          ]
+        }
+      };
+      actions.push({
+        title: "Add 'option pkgid = 1' to enable 16-bit message IDs",
+        kind: CodeActionKind.QuickFix,
+        diagnostics: [diag],
+        edit,
+      });
+    }
+
+    if (data.fix === 'add_variable_true') {
+      // Insert `option variable = true;` inside the message block — after the last
+      // existing option line, or right after the opening brace if none.
+      const msgLineNum = data.msgLine as number;
+      const lines = doc.getText().split('\n');
+      let insertAfter = msgLineNum;
+      for (let i = msgLineNum + 1; i < lines.length; i++) {
+        const t = lines[i].trimStart();
+        if (t.startsWith('}')) break;
+        if (t.startsWith('option ')) insertAfter = i;
+        else if (t.length > 0 && !t.startsWith('//') && insertAfter === msgLineNum) break;
+      }
+      const edit: WorkspaceEdit = {
+        changes: {
+          [params.textDocument.uri]: [
+            TextEdit.insert(Position.create(insertAfter + 1, 0), '  option variable = true;\n')
+          ]
+        }
+      };
+      actions.push({
+        title: "Add 'option variable = true'",
+        kind: CodeActionKind.QuickFix,
+        diagnostics: [diag],
+        edit,
+      });
+    }
   }
 
   return actions;
@@ -2372,6 +2468,106 @@ connection.onWorkspaceSymbol((params) => {
   }
 
   return results;
+});
+
+// ── Rename ─────────────────────────────────────────────────────────────────
+connection.onPrepareRename((params) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return null;
+
+  const wordInfo = getWordAtPosition(doc.getText(), params.position);
+  if (!wordInfo) return null;
+  const { word, start, end } = wordInfo;
+
+  // Only PascalCase identifiers (messages and enums can be renamed)
+  if (!/^[A-Z]/.test(word)) return null;
+
+  const allDefs = getAllDefinitions(params.textDocument.uri);
+  const isKnown = allDefs.messages.some(m => m.name === word) || allDefs.enums.some(e => e.name === word);
+  if (!isKnown) return null;
+
+  return Range.create(params.position.line, start, params.position.line, end);
+});
+
+connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return null;
+
+  const wordInfo = getWordAtPosition(doc.getText(), params.position);
+  if (!wordInfo) return null;
+  const { word } = wordInfo;
+  const newName = params.newName.trim();
+
+  if (!/^[A-Z]/.test(word) || !/^[A-Z]/.test(newName)) return null;
+
+  // Collect all open .sf documents to search
+  const urisToSearch = new Set<string>([params.textDocument.uri]);
+  for (const [uri] of parsedDocuments) {
+    if (uri.endsWith('.sf')) urisToSearch.add(uri);
+  }
+
+  const changes: Record<string, TextEdit[]> = {};
+
+  for (const uri of urisToSearch) {
+    const parsed = getOrParseDocument(uri);
+
+    // Collect line numbers that reference this type
+    const targetLines = new Set<number>();
+
+    // Declaration lines (message/enum definition)
+    parsed.messages.forEach(m => { if (m.name === word) targetLines.add(m.line); });
+    parsed.enums.forEach(e => { if (e.name === word) targetLines.add(e.line); });
+
+    // Field type references in all message scopes
+    for (const msg of parsed.messages) {
+      for (const field of msg.fields) {
+        if (field.type === word) targetLines.add(field.line);
+      }
+      for (const oneof of msg.oneofs) {
+        for (const field of oneof.fields) {
+          if (field.type === word) targetLines.add(field.line);
+        }
+      }
+      for (const nm of msg.nestedMessages) {
+        for (const field of nm.fields) {
+          if (field.type === word) targetLines.add(field.line);
+        }
+      }
+    }
+
+    if (targetLines.size === 0) continue;
+
+    // Get content for this URI (prefer open document, fall back to disk)
+    const content = (() => {
+      const openDoc = documents.get(uri);
+      if (openDoc) return openDoc.getText();
+      try {
+        const filePath = uri.startsWith('file://') ? fileURLToPath(uri) : uri;
+        return fs.readFileSync(filePath, 'utf-8');
+      } catch { return null; }
+    })();
+    if (!content) continue;
+
+    const lines = content.split('\n');
+    const edits: TextEdit[] = [];
+    const wordRe = new RegExp(`\\b${word}\\b`, 'g');
+
+    for (const lineNum of targetLines) {
+      const lineText = lines[lineNum] ?? '';
+      wordRe.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = wordRe.exec(lineText)) !== null) {
+        edits.push(TextEdit.replace(
+          Range.create(lineNum, match.index, lineNum, match.index + word.length),
+          newName
+        ));
+      }
+    }
+
+    if (edits.length > 0) changes[uri] = edits;
+  }
+
+  return { changes };
 });
 
 documents.listen(connection);
