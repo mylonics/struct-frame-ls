@@ -136,6 +136,7 @@ export function activate(context: ExtensionContext): void {
       ],
       configurationSection: 'structFrameLs'
     },
+    outputChannel: window.createOutputChannel('Struct Frame Language Server'),
     middleware
   };
 

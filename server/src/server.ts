@@ -98,16 +98,24 @@ let sfCompileConfigPath = 'sf_compile.json';
 let workspaceRoot = '';
 
 function loadSfCompileConfig(): void {
-  if (!workspaceRoot) return;
+  if (!workspaceRoot) {
+    connection.console.warn('loadSfCompileConfig: workspaceRoot is not set, skipping.');
+    return;
+  }
   let configPath = sfCompileConfigPath;
   if (!path.isAbsolute(configPath)) {
     configPath = path.join(workspaceRoot, configPath);
   }
+  connection.console.log(`loadSfCompileConfig: reading '${configPath}'`);
   try {
     const content = fs.readFileSync(configPath, 'utf-8');
     sfCompileConfig = JSON.parse(content) as SfCompileConfig;
-  } catch {
+    const msgCount = sfCompileConfig.messages.length + (sfCompileConfig.nested_messages?.length ?? 0);
+    const enumCount = sfCompileConfig.enums.length;
+    connection.console.log(`loadSfCompileConfig: loaded ${msgCount} message(s) and ${enumCount} enum(s) from '${configPath}'`);
+  } catch (err) {
     sfCompileConfig = null;
+    connection.console.error(`loadSfCompileConfig: failed to read/parse '${configPath}': ${err}`);
   }
 }
 
@@ -136,9 +144,14 @@ function getCompileConfigSourceDir(): string {
 }
 
 async function refreshConfiguration(): Promise<void> {
-  if (!hasConfigurationCapability) return;
+  if (!hasConfigurationCapability) {
+    connection.console.warn('refreshConfiguration: client does not support workspace configuration; using defaults.');
+    loadSfCompileConfig();
+    return;
+  }
   const config = await connection.workspace.getConfiguration('structFrameLs');
   sfCompileConfigPath = (config?.compileConfigPath as string) || 'sf_compile.json';
+  connection.console.log(`refreshConfiguration: compileConfigPath = '${sfCompileConfigPath}'`);
   loadSfCompileConfig();
 }
 
@@ -322,7 +335,9 @@ function getOrParseDocument(uri: string): ParsedDocument {
     try {
       const filePath = uri.startsWith('file://') ? fileURLToPath(uri) : uri;
       content = fs.readFileSync(filePath, 'utf-8');
-    } catch {
+      connection.console.log(`getOrParseDocument: read from filesystem '${filePath}'`);
+    } catch (err) {
+      connection.console.error(`getOrParseDocument: could not read '${uri}': ${err}`);
       return { uri, packageName: '', imports: [], messages: [], enums: [] };
     }
   }
@@ -336,7 +351,12 @@ function resolveImportUri(importPath: string, currentUri: string): string {
   const currentFilePath = currentUri.startsWith('file://') ? fileURLToPath(currentUri) : currentUri;
   const currentDir = path.dirname(currentFilePath);
   const resolvedPath = path.resolve(currentDir, importPath);
-  return pathToFileURL(resolvedPath).toString();
+  const resolved = pathToFileURL(resolvedPath).toString();
+  connection.console.log(`resolveImportUri: '${importPath}' from '${currentFilePath}' -> '${resolvedPath}'`);
+  if (!fs.existsSync(resolvedPath)) {
+    connection.console.warn(`resolveImportUri: resolved path does not exist: '${resolvedPath}'`);
+  }
+  return resolved;
 }
 
 function getAllDefinitions(uri: string, visited = new Set<string>()): { messages: MessageDefinition[]; enums: EnumDefinition[] } {
@@ -376,6 +396,7 @@ connection.onInitialize((params: InitializeParams) => {
   const capabilities = params.capabilities;
   hasConfigurationCapability = !!(capabilities.workspace && !!capabilities.workspace.configuration);
   hasWorkspaceFolderCapability = !!(capabilities.workspace && !!capabilities.workspace.workspaceFolders);
+  connection.console.log(`onInitialize: hasConfigurationCapability=${hasConfigurationCapability}, hasWorkspaceFolderCapability=${hasWorkspaceFolderCapability}`);
 
   const result: InitializeResult = {
     capabilities: {
@@ -400,12 +421,16 @@ connection.onInitialize((params: InitializeParams) => {
   if (params.workspaceFolders && params.workspaceFolders.length > 0) {
     const folderUri = params.workspaceFolders[0].uri;
     workspaceRoot = folderUri.startsWith('file://') ? fileURLToPath(folderUri) : folderUri;
+    connection.console.log(`onInitialize: workspaceRoot='${workspaceRoot}'`);
+  } else {
+    connection.console.warn('onInitialize: no workspace folders provided; sf_compile.json resolution may fail.');
   }
 
   return result;
 });
 
 connection.onInitialized(async () => {
+  connection.console.log('Struct Frame language server initialized.');
   if (hasConfigurationCapability) {
     connection.client.register(DidChangeConfigurationNotification.type, undefined);
   }
@@ -588,7 +613,10 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
 // Go-to-Definition
 connection.onDefinition((params: TextDocumentPositionParams): Definition | null => {
   const doc = documents.get(params.textDocument.uri);
-  if (!doc) return null;
+  if (!doc) {
+    connection.console.warn(`onDefinition: document not found: '${params.textDocument.uri}'`);
+    return null;
+  }
 
   const wordInfo = getWordAtPosition(doc.getText(), params.position);
   if (!wordInfo) return null;
@@ -597,6 +625,8 @@ connection.onDefinition((params: TextDocumentPositionParams): Definition | null 
 
   // Only look up PascalCase identifiers (user-defined types)
   if (!/^[A-Z]/.test(word)) return null;
+
+  connection.console.log(`onDefinition: looking up '${word}' in '${params.textDocument.uri}'`);
 
   function findDefinition(uri: string, visited = new Set<string>()): Location | null {
     if (visited.has(uri)) return null;
@@ -633,12 +663,19 @@ connection.onDefinition((params: TextDocumentPositionParams): Definition | null 
   if (isDeclaration) {
     // On the declaration → peek all generated files (no .sf)
     const generatedLocations = findGeneratedFileLocations(word);
-    if (generatedLocations.length === 0) return null;
+    if (generatedLocations.length === 0) {
+      connection.console.warn(`onDefinition: no generated file locations found for declaration '${word}'.`);
+      return null;
+    }
     if (generatedLocations.length === 1) return generatedLocations[0];
     return generatedLocations;
   } else {
     // Field type reference → navigate to .sf definition only
-    return sfLocation || findSfSourceLocation(word);
+    const result = sfLocation || findSfSourceLocation(word);
+    if (!result) {
+      connection.console.warn(`onDefinition: could not resolve definition for '${word}' (not found in .sf files or compile config).`);
+    }
+    return result;
   }
 });
 
@@ -655,28 +692,55 @@ function findElementLineInFile(filePath: string, elementName: string): number {
 }
 
 function findSfSourceLocation(word: string): Location | null {
+  if (!sfCompileConfig) {
+    connection.console.warn(`findSfSourceLocation('${word}'): sfCompileConfig is not loaded.`);
+    return null;
+  }
   const entry = findInCompileConfig(word);
-  if (!entry || !entry.source_file) return null;
+  if (!entry || !entry.source_file) {
+    connection.console.log(`findSfSourceLocation('${word}'): no compile config entry found.`);
+    return null;
+  }
   const sourceDir = getCompileConfigSourceDir();
-  if (!sourceDir) return null;
+  if (!sourceDir) {
+    connection.console.warn(`findSfSourceLocation('${word}'): could not determine source directory.`);
+    return null;
+  }
   const sourceFilePath = path.resolve(sourceDir, entry.source_file);
   try {
-    if (!fs.statSync(sourceFilePath).isFile()) return null;
-  } catch { return null; }
+    if (!fs.statSync(sourceFilePath).isFile()) {
+      connection.console.warn(`findSfSourceLocation('${word}'): '${sourceFilePath}' is not a file.`);
+      return null;
+    }
+  } catch (err) {
+    connection.console.error(`findSfSourceLocation('${word}'): cannot stat '${sourceFilePath}': ${err}`);
+    return null;
+  }
   const sourceUri = pathToFileURL(sourceFilePath).toString();
   const parsed = getOrParseDocument(sourceUri);
   const msg = parsed.messages.find(m => m.name === word);
   if (msg) return Location.create(sourceUri, Range.create(msg.line, 0, msg.line, word.length + 8));
   const enm = parsed.enums.find(e => e.name === word);
   if (enm) return Location.create(sourceUri, Range.create(enm.line, 0, enm.line, word.length + 5));
+  connection.console.warn(`findSfSourceLocation('${word}'): definition not found in '${sourceFilePath}'.`);
   return null;
 }
 
 function findGeneratedFileLocations(word: string): Location[] {
+  if (!sfCompileConfig) {
+    connection.console.warn(`findGeneratedFileLocations('${word}'): sfCompileConfig is not loaded.`);
+    return [];
+  }
   const entry = findInCompileConfig(word);
-  if (!entry) return [];
+  if (!entry) {
+    connection.console.log(`findGeneratedFileLocations('${word}'): no compile config entry found.`);
+    return [];
+  }
   const sourceDir = getCompileConfigSourceDir();
-  if (!sourceDir) return [];
+  if (!sourceDir) {
+    connection.console.warn(`findGeneratedFileLocations('${word}'): could not determine source directory.`);
+    return [];
+  }
   const locations: Location[] = [];
   const seen = new Set<string>();
   for (const fileEntry of Object.values(entry.generated_files)) {
@@ -685,11 +749,20 @@ function findGeneratedFileLocations(word: string): Location[] {
     if (seen.has(absPath)) continue;
     seen.add(absPath);
     try {
-      if (!fs.statSync(absPath).isFile()) continue;
-    } catch { continue; }
+      if (!fs.statSync(absPath).isFile()) {
+        connection.console.warn(`findGeneratedFileLocations('${word}'): '${absPath}' is not a file, skipping.`);
+        continue;
+      }
+    } catch (err) {
+      connection.console.error(`findGeneratedFileLocations('${word}'): cannot stat '${absPath}': ${err}`);
+      continue;
+    }
     const fileUri = pathToFileURL(absPath).toString();
     const line = findElementLineInFile(absPath, fileEntry.element);
     locations.push(Location.create(fileUri, Range.create(line, 0, line, fileEntry.element.length)));
+  }
+  if (locations.length === 0) {
+    connection.console.warn(`findGeneratedFileLocations('${word}'): no generated files found on disk.`);
   }
   return locations;
 }
