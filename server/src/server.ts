@@ -590,6 +590,11 @@ function validateDocument(uri: string): void {
     // is_envelope: requires exactly 1 oneof; all oneof variants must be message types
     if (msg.options['is_envelope'] === 'true') {
       const optLine = msg.optionLines['is_envelope'] ?? msg.line;
+      if (!msg.options['msgid']) {
+        diagnostics.push(makeDiagnostic(optLine,
+          `is_envelope message '${msg.name}' should have option msgid for routing`,
+          DiagnosticSeverity.Warning));
+      }
       if (msg.oneofs.length !== 1) {
         diagnostics.push(makeDiagnostic(optLine,
           `is_envelope requires exactly one oneof field (found ${msg.oneofs.length})`));
@@ -655,6 +660,13 @@ function validateDocument(uri: string): void {
     // oneof discriminator validation
     for (const oneof of msg.oneofs) {
       const disc = (oneof.options['discriminator'] ?? '').replace(/"/g, '').trim();
+      if (disc !== '' && !DISCRIMINATOR_VALUES.includes(disc)) {
+        diagnostics.push(makeDiagnostic(
+          oneof.line,
+          `Unknown discriminator value '${disc}'. Valid values: ${DISCRIMINATOR_VALUES.join(', ')}`,
+          DiagnosticSeverity.Error
+        ));
+      }
       if (disc === 'msgid') {
         for (const field of oneof.fields) {
           const variantMsg = allDefs.messages.find(m => m.name === field.type);
@@ -663,7 +675,9 @@ function validateDocument(uri: string): void {
               `discriminator=msgid: variant '${field.name}' type '${field.type}' is not a known message`));
           } else if (!variantMsg.options['msgid']) {
             diagnostics.push(makeDiagnostic(field.line,
-              `discriminator=msgid: variant '${field.name}' (type '${field.type}') does not have msgid`));
+              `discriminator=msgid: variant '${field.name}' (type '${field.type}') does not have msgid`,
+              DiagnosticSeverity.Error,
+              { fix: 'add_msgid', fieldLine: field.line, msgName: field.type }));
           }
         }
       }
@@ -757,7 +771,7 @@ function validateDocument(uri: string): void {
         }
       }
 
-      // Validate size and max_size values are positive integers; max_size ≤ 255 for repeated fields
+      // Validate size and max_size values are positive integers (1–65535)
       if (hasSize) {
         const sizeVal = parseInt(field.options['size'], 10);
         if (isNaN(sizeVal) || sizeVal <= 0) {
@@ -770,9 +784,9 @@ function validateDocument(uri: string): void {
         if (isNaN(maxSizeVal) || maxSizeVal <= 0) {
           diagnostics.push(makeDiagnostic(field.line,
             `'max_size' must be a positive integer, got '${field.options['max_size']}'`));
-        } else if (field.repeated && maxSizeVal > 255) {
+        } else if (maxSizeVal > 65535) {
           diagnostics.push(makeDiagnostic(field.line,
-            `'max_size' must be ≤ 255 for repeated fields (count prefix is 1 byte), got ${maxSizeVal}`));
+            `'max_size' must be ≤ 65535, got ${maxSizeVal}`));
         }
       }
 
@@ -782,6 +796,9 @@ function validateDocument(uri: string): void {
           diagnostics.push(makeDiagnostic(field.line,
             `flatten is only valid on message-type fields ('${field.type}' is not a known message)`));
         } else {
+          diagnostics.push(makeDiagnostic(field.line,
+            `flatten=true only affects Python and GraphQL output; has no effect on C, C++, C#, TypeScript, or Rust`,
+            DiagnosticSeverity.Information));
           const nestedMsg = allDefs.messages.find(m => m.name === field.type);
           if (nestedMsg) {
             const parentFieldNames = new Set(
@@ -1105,7 +1122,7 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
     if (/(?:^|,)\s*(?:(?:sf|struct_frame)\.)?[a-zA-Z_]*$/.test(afterBracket)) {
       const FIELD_OPT_COMPLETIONS: Record<string, { detail: string; documentation: string }> = {
         'size=': { detail: 'Field option', documentation: 'Fixed-size allocation. Strings padded to exactly N bytes; arrays always have exactly N elements. Must be a positive integer.' },
-        'max_size=': { detail: 'Field option', documentation: 'Bounded variable-size. Strings get a length prefix + up to N bytes. Arrays get a count prefix + up to N elements. Must be ≤ 255 for repeated fields.' },
+        'max_size=': { detail: 'Field option', documentation: 'Bounded variable-size (1–65535). Strings get a length prefix + up to N bytes. Arrays get a count prefix + up to N elements. Uses a 1-byte (uint8) count prefix if max_size ≤ 255, or a 2-byte (uint16) count prefix if max_size > 255.' },
         'element_size=': { detail: 'Field option', documentation: 'Only for `repeated string` arrays. Size of each individual string element. Must be combined with `size=` or `max_size=`.' },
         'flatten=': { detail: 'Field option', documentation: 'Only on message-type fields. Inlines the nested message fields directly into the parent. Field names must not collide.' },
       };
@@ -1124,12 +1141,35 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
         return true; // size= and max_size= always applicable
       });
 
-      return applicableOpts.map(opt => ({
+      const optItems: CompletionItem[] = applicableOpts.map(opt => ({
         label: opt,
         kind: CompletionItemKind.Property,
         detail: FIELD_OPT_COMPLETIONS[opt]?.detail ?? 'Field option',
         documentation: FIELD_OPT_COMPLETIONS[opt]?.documentation,
       }));
+
+      // For repeated string fields, offer combined snippets at the top
+      if (isRepeated && isStringType) {
+        optItems.unshift(
+          {
+            label: 'max_size=, element_size=',
+            kind: CompletionItemKind.Snippet,
+            detail: 'Bounded repeated string (combined)',
+            insertText: 'max_size=${1:10}, element_size=${2:32}',
+            insertTextFormat: InsertTextFormat.Snippet,
+            documentation: 'Bounded array of strings: up to N strings (with 1-byte count prefix), each up to M bytes.',
+          },
+          {
+            label: 'size=, element_size=',
+            kind: CompletionItemKind.Snippet,
+            detail: 'Fixed repeated string (combined)',
+            insertText: 'size=${1:10}, element_size=${2:32}',
+            insertTextFormat: InsertTextFormat.Snippet,
+            documentation: 'Fixed array of strings: exactly N strings, each up to M bytes.',
+          }
+        );
+      }
+      return optItems;
     }
     return [];
   }
@@ -1190,15 +1230,44 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
     return [];
   }
 
+  // ── 6. Field number suggestion (field declaration `Type name = `) ────────
+  if ((inMessage || inOneof) && !inEnum && !/^\s*option\s+/.test(lineUpToCursor)) {
+    if (/^\s*(repeated\s+)?[a-zA-Z_]\w*\s+[a-zA-Z_]\w*\s*=\s*$/.test(lineUpToCursor)) {
+      const parsedDoc = getOrParseDocument(params.textDocument.uri);
+      const currentLine = params.position.line;
+      const containingMsg = parsedDoc.messages
+        .filter(m => m.line <= currentLine && currentLine <= (m.endLine ?? Infinity))
+        .sort((a, b) => b.line - a.line)[0]; // innermost (latest start)
+      if (containingMsg) {
+        const usedTags = new Set<number>([
+          ...containingMsg.fields.map(f => f.tag),
+          ...containingMsg.oneofs.flatMap(o => o.fields.map(f => f.tag))
+        ]);
+        let nextTag = 1;
+        while (usedTags.has(nextTag)) nextTag++;
+        return [{ label: String(nextTag), kind: CompletionItemKind.Value, detail: 'Next available field number', sortText: '0' }];
+      }
+    }
+  }
+
   // ── 7. Inside enum ──────────────────────────────────────────────────────
   if (inEnum) {
-    if (/^\s*[A-Z_]*$/.test(lineUpToCursor)) {
+    if (/^\s*[A-Za-z_]*$/.test(lineUpToCursor)) {
+      const parsedDoc = getOrParseDocument(params.textDocument.uri);
+      const currentLine = params.position.line;
+      const containingEnum = parsedDoc.enums.find(
+        e => e.line <= currentLine && currentLine <= (e.endLine ?? Infinity)
+      );
+      let nextVal = 0;
+      if (containingEnum && containingEnum.values.length > 0) {
+        nextVal = Math.max(...containingEnum.values.map(v => v.value)) + 1;
+      }
       return [
         {
-          label: 'VALUE_NAME = 0;',
+          label: `VALUE_NAME = ${nextVal};`,
           kind: CompletionItemKind.Snippet,
-          detail: 'Enum value entry',
-          insertText: '${1:VALUE_NAME} = ${2:0};',
+          detail: nextVal === 0 ? 'First enum value' : `Next enum value (${nextVal})`,
+          insertText: `\${1:VALUE_NAME} = \${2:${nextVal}};`,
           insertTextFormat: InsertTextFormat.Snippet,
         }
       ];
@@ -1212,6 +1281,22 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
       const allDefs = getAllDefinitions(params.textDocument.uri);
       return [
         { label: 'option', kind: CompletionItemKind.Keyword },
+        {
+          label: 'string (fixed)',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Fixed-size string field',
+          insertText: 'string ${1:field_name} = ${2:1} [size=${3:16}];',
+          insertTextFormat: InsertTextFormat.Snippet,
+          documentation: 'Fixed-size UTF-8 string. Always uses exactly N bytes (padded with nulls).',
+        },
+        {
+          label: 'string (variable)',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Variable-size string field',
+          insertText: 'string ${1:field_name} = ${2:1} [max_size=${3:64}];',
+          insertTextFormat: InsertTextFormat.Snippet,
+          documentation: 'Variable-length UTF-8 string. Stores up to N chars plus a 1-byte length prefix.',
+        },
         ...PRIMITIVE_TYPES.map(t => ({
           label: t, kind: CompletionItemKind.TypeParameter,
           detail: 'Primitive type', documentation: PRIMITIVE_TYPE_DOCS[t]
@@ -1230,13 +1315,60 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
       const allDefs = getAllDefinitions(params.textDocument.uri);
       return [
         { label: 'option', kind: CompletionItemKind.Keyword },
-        { label: 'repeated', kind: CompletionItemKind.Keyword },
+        {
+          label: 'repeated <primitive>',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Repeated primitive field (fixed or bounded array)',
+          insertText: 'repeated ${1|int8,uint8,int16,uint16,int32,uint32,int64,uint64,float,double,bool|} ${2:field_name} = ${3:1} [${4|size=4,max_size=16|}];',
+          insertTextFormat: InsertTextFormat.Snippet,
+          documentation: 'Array of primitive values. Use size= for fixed count, max_size= (\u226455 elements) for variable count with 1-byte prefix.',
+        },
+        {
+          label: 'repeated string',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Repeated string field (string array)',
+          insertText: 'repeated string ${1:field_name} = ${2:1} [${3|max_size=10,size=10|}, element_size=${4:32}];',
+          insertTextFormat: InsertTextFormat.Snippet,
+          documentation: 'Array of strings. Requires size/max_size for the array count and element_size for each string byte limit.',
+        },
+        {
+          label: 'repeated <message>',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Repeated message field (message array)',
+          insertText: 'repeated ${1:MessageType} ${2:field_name} = ${3:1} [${4|size=4,max_size=8|}];',
+          insertTextFormat: InsertTextFormat.Snippet,
+          documentation: 'Array of nested message values. Use size= for fixed count, max_size= (\u226455) for variable count.',
+        },
+        {
+          label: 'string (fixed)',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Fixed-size string field',
+          insertText: 'string ${1:field_name} = ${2:1} [size=${3:16}];',
+          insertTextFormat: InsertTextFormat.Snippet,
+          documentation: 'Fixed-size UTF-8 string. Always uses exactly N bytes (padded with nulls).',
+        },
+        {
+          label: 'string (variable)',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Variable-size string field',
+          insertText: 'string ${1:field_name} = ${2:1} [max_size=${3:64}];',
+          insertTextFormat: InsertTextFormat.Snippet,
+          documentation: 'Variable-length UTF-8 string. Stores up to N chars plus a 1-byte length prefix.',
+        },
         {
           label: 'oneof',
           kind: CompletionItemKind.Snippet,
           detail: 'Oneof union field',
           insertText: 'oneof ${1:name} {\n  ${2:TypeA} ${3:field_a} = ${4:1};\n  ${5:TypeB} ${6:field_b} = ${7:2};\n}',
           insertTextFormat: InsertTextFormat.Snippet,
+        },
+        {
+          label: 'oneof (with discriminator)',
+          kind: CompletionItemKind.Snippet,
+          detail: 'Oneof union field with explicit discriminator option',
+          insertText: 'oneof ${1:name} {\n  option discriminator = ${2|auto,msgid,field_order,none|};\n  ${3:TypeA} ${4:field_a} = ${5:1};\n  ${6:TypeB} ${7:field_b} = ${8:2};\n}',
+          insertTextFormat: InsertTextFormat.Snippet,
+          documentation: 'auto: msgid if all variants have one, else field_order.\nmsgid: uint16 by message ID.\nfield_order: uint8 1-based index + companion enum.\nnone: no discriminator stored.',
         },
         {
           label: 'enum',
@@ -1285,8 +1417,16 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
         label: 'message',
         kind: CompletionItemKind.Snippet,
         detail: 'Message definition',
-        insertText: 'message ${1:MessageName} {\n  option msgid = ${2:1};\n\n  ${3:uint32} ${4:field_name} = 1;\n}',
+        insertText: 'message ${1:MessageName} {\n  option msgid = ${2:1};\n\n  ${3:uint32} ${4:field_name} = ${5:1};\n}',
         insertTextFormat: InsertTextFormat.Snippet,
+      },
+      {
+        label: 'message (variable)',
+        kind: CompletionItemKind.Snippet,
+        detail: 'Variable-length message definition',
+        insertText: 'message ${1:MessageName} {\n  option msgid = ${2:1};\n  option variable = true;\n\n  string ${3:name} = 1 [max_size=${4:64}];\n  repeated uint8 ${5:data} = 2 [max_size=${6:128}];\n}',
+        insertTextFormat: InsertTextFormat.Snippet,
+        documentation: 'Message with variable=true: arrays and strings only transmit used bytes (max_size fields), reducing bandwidth.',
       },
       {
         label: 'enum',
@@ -1431,7 +1571,20 @@ function findElementLineInFile(filePath: string, elementName: string): number {
   try {
     const content = fs.readFileSync(filePath, 'utf-8');
     const lines = content.split('\n');
-    const re = new RegExp(`\\b${elementName}\\b`);
+
+    // Use the unqualified name (strip leading namespace qualifiers like "ns::Name")
+    const unqualified = elementName.includes('::')
+      ? elementName.substring(elementName.lastIndexOf('::') + 2)
+      : elementName;
+    const escaped = unqualified.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // Prefer a line that looks like a definition (struct/class/enum/typedef/using)
+    const defRe = new RegExp(`\\b(?:struct|class|enum(?:\\s+class)?|typedef|using)\\s+${escaped}\\b`);
+    const defIdx = lines.findIndex(l => defRe.test(l));
+    if (defIdx >= 0) return defIdx;
+
+    // Fall back to any line containing the unqualified name as a whole word
+    const re = new RegExp(`\\b${escaped}\\b`);
     const idx = lines.findIndex(l => re.test(l));
     return idx >= 0 ? idx : 0;
   } catch {
@@ -1634,13 +1787,42 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
     if (bracketStart >= 0 && (bracketEnd < 0 || bracketEnd > bracketStart)) {
       const FIELD_OPT_DOCS: Record<string, string> = {
         size: '**size=N** *(field option)*\n\nFixed-size allocation (1–65535). Strings are padded to exactly N bytes; arrays always contain exactly N elements.',
-        max_size: '**max_size=N** *(field option)*\n\nBounded variable-size (1–65535). Strings get a 1–2 byte length prefix + up to N chars. Arrays get a count prefix + up to N elements.',
+        max_size: '**max_size=N** *(field option)*\n\nBounded variable-size (1–65535). Strings get a 1–2 byte length prefix + up to N chars. Arrays get a count prefix + up to N elements — uses a 1-byte (`uint8`) count if N ≤ 255, or a 2-byte (`uint16`) count if N > 255.',
         element_size: '**element_size=M** *(field option)*\n\nSize of each string in a `repeated string` array (1–65535). Must be combined with `size` or `max_size`.',
         flatten: '**flatten=true** *(field option)*\n\nOnly on message-type fields. Inlines the nested message\'s fields directly into the parent struct. Field names must not collide with the parent\'s existing fields.'
       };
       if (FIELD_OPT_DOCS[word]) {
         return { contents: { kind: MarkupKind.Markdown, value: FIELD_OPT_DOCS[word] } };
       }
+    }
+  }
+
+  // Field tag number or enum value number hover
+  if (/^\d+$/.test(word)) {
+    const lineText = doc.getText().split('\n')[params.position.line] || '';
+    // Field tag: `Type fieldname = N;` or `repeated Type fieldname = N [opts];`
+    const fieldTagMatch = lineText.match(
+      /^\s*(repeated\s+)?[a-zA-Z_][a-zA-Z0-9_]*\s+[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*(\d+)\s*(?:\[([^\]]*)\])?\s*;/
+    );
+    if (fieldTagMatch && fieldTagMatch[2] === word) {
+      const tag = parseInt(word, 10);
+      return {
+        contents: {
+          kind: MarkupKind.Markdown,
+          value: `**Field number ${tag}**\n\nUnique tag within this message/oneof. Identifies the field in binary layout and code generation. Must be unique across all fields and oneof variants in the same message.`
+        }
+      };
+    }
+    // Enum value: `VALUE_NAME = N;`
+    const enumValMatch = lineText.match(/^\s*[A-Za-z][A-Za-z0-9_]*\s*=\s*(\d+)\s*;/);
+    if (enumValMatch && enumValMatch[1] === word) {
+      const val = parseInt(word, 10);
+      return {
+        contents: {
+          kind: MarkupKind.Markdown,
+          value: `**Enum value ${val}** (0x${val.toString(16).toUpperCase().padStart(2, '0')})\n\nStored as \`uint8\` (1 byte). Valid range: 0\u2013255.`
+        }
+      };
     }
   }
 
@@ -1834,7 +2016,7 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
       import: '**import** *(keyword)*\n\nIncludes types from another `.sf` file. Imported message and enum types can be used as field types.\n\n```sf\nimport "types.sf";\n```',
       message: '**message** *(keyword)*\n\nDefines a fixed-size packed struct. Requires `option msgid` for top-level routable messages. Fields must have unique field numbers.\n\n```sf\nmessage Heartbeat {\n  option msgid = 1;\n  uint64 timestamp = 1;\n}\n```',
       enum: '**enum** *(keyword)*\n\nDefines an enumeration stored as `uint8` (1 byte). Values must be unique within the enum. Can be defined at file level or nested inside a message.\n\n```sf\nenum State { IDLE = 0; RUNNING = 1; }\n```',
-      repeated: '**repeated** *(keyword)*\n\nDeclares an array field. Must specify `[size=N]` (fixed) or `[max_size=N]` (variable, max 255 elements). Repeated string arrays also need `[element_size=M]`.',
+      repeated: '**repeated** *(keyword)*\n\nDeclares an array field. Must specify `[size=N]` (fixed array) or `[max_size=N]` (variable-count array, 1–65535 elements). For `repeated string` arrays, also requires `[element_size=M]`.\n\nThe count prefix size is automatic: `uint8` (1 byte) when `max_size` ≤ 255, `uint16` (2 bytes) when `max_size` > 255.\n\nAvailable snippets:\n- `repeated <primitive>` — fixed/bounded array of primitive values\n- `repeated string` — array of strings with element_size\n- `repeated <message>` — array of nested messages',
       oneof: '**oneof** *(keyword)*\n\nDeclares a union field where only one variant is active at a time. All variants share the same memory (size of largest type). Generates an auto-discriminator field.',
       option: '**option** *(keyword)*\n\nSets a message, oneof, or file-level option. Common options: `msgid`, `pkgid`, `variable`, `is_envelope`, `discriminator`.',
     };
@@ -1997,6 +2179,35 @@ connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
           diagnostics: [diag],
           edit,
         });
+      }
+    }
+
+    if (data.fix === 'add_msgid') {
+      const targetMsgName = (data as Record<string, unknown>).msgName as string | undefined;
+      if (targetMsgName) {
+        const parsedDoc = getOrParseDocument(params.textDocument.uri);
+        const targetMsg = parsedDoc.messages.find(m => m.name === targetMsgName);
+        if (targetMsg) {
+          const usedIds = new Set(parsedDoc.messages
+            .map(m => parseInt(m.options['msgid'] ?? '-1', 10))
+            .filter(n => !isNaN(n) && n >= 0));
+          let nextFree = 1;
+          while (usedIds.has(nextFree)) nextFree++;
+          const insertLine = targetMsg.line + 1;
+          const edit: WorkspaceEdit = {
+            changes: {
+              [params.textDocument.uri]: [
+                TextEdit.insert(Position.create(insertLine, 0), `  option msgid = ${nextFree};\n`)
+              ]
+            }
+          };
+          actions.push({
+            title: `Add 'option msgid = ${nextFree}' to '${targetMsgName}'`,
+            kind: CodeActionKind.QuickFix,
+            diagnostics: [diag],
+            edit,
+          });
+        }
       }
     }
   }
