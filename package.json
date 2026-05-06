@@ -58,7 +58,7 @@
       }
     ],
     "configuration": {
-      "title": "Struct Frame Language Server",
+      "title": "Struct Frame LS",
       "properties": {
         "structFrameLs.compileConfigPath": {
           "type": "string",
@@ -80,13 +80,16 @@
     "server"
   ],
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "node esbuild.js --production",
     "compile": "tsc -b",
-    "watch": "tsc -b -w",
+    "watch": "node esbuild.js --watch",
+    "bundle": "node esbuild.js",
+    "typecheck": "tsc -b --noEmit",
     "package": "vsce package"
   },
   "devDependencies": {
     "@types/vscode": "^1.75.0",
+    "esbuild": "^0.25.0",
     "typescript": "^5.0.0"
   }
 }

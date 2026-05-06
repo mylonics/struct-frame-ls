@@ -136,13 +136,13 @@ export function activate(context: ExtensionContext): void {
       ],
       configurationSection: 'structFrameLs'
     },
-    outputChannel: window.createOutputChannel('Struct Frame Language Server'),
+    outputChannel: window.createOutputChannel('Struct Frame LS'),
     middleware
   };
 
   client = new LanguageClient(
     'struct-frame-ls',
-    'Struct Frame Language Server',
+    'Struct Frame LS',
     serverOptions,
     clientOptions
   );

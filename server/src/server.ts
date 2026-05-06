@@ -17,7 +17,9 @@ import {
   DocumentSymbol,
   SymbolKind,
   Definition,
-  FileChangeType
+  FileChangeType,
+  Diagnostic,
+  DiagnosticSeverity
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
@@ -36,12 +38,22 @@ interface FieldDefinition {
   line: number;
 }
 
-interface MessageDefinition {
+interface OneofDefinition {
   name: string;
   line: number;
   endLine: number;
   fields: FieldDefinition[];
   options: Record<string, string>;
+}
+
+interface MessageDefinition {
+  name: string;
+  line: number;
+  endLine: number;
+  fields: FieldDefinition[];
+  oneofs: OneofDefinition[];
+  options: Record<string, string>;
+  optionLines: Record<string, number>;
 }
 
 interface EnumValue {
@@ -64,6 +76,8 @@ interface ParsedDocument {
   imports: string[];
   messages: MessageDefinition[];
   enums: EnumDefinition[];
+  fileOptions: Record<string, string>;
+  fileOptionLines: Record<string, number>;
 }
 
 const parsedDocuments = new Map<string, ParsedDocument>();
@@ -179,8 +193,26 @@ const PRIMITIVE_TYPE_DOCS: Record<string, string> = {
 };
 
 const KEYWORDS = ['package', 'import', 'option', 'message', 'enum', 'repeated', 'oneof'];
-const OPTION_NAMES = ['msgid', 'pkgid', 'variable'];
+const FILE_OPTION_NAMES = ['pkgid'];
+const MESSAGE_OPTION_NAMES = ['msgid', 'variable', 'is_envelope'];
+const ONEOF_OPTION_NAMES = ['discriminator'];
+const DISCRIMINATOR_VALUES = ['auto', 'msgid', 'field_order', 'none'];
 const FIELD_OPTION_NAMES = ['size=', 'max_size=', 'element_size=', 'flatten='];
+
+function normalizeFieldOptionKey(key: string): string {
+  if (key.startsWith('struct_frame.')) return key.substring('struct_frame.'.length);
+  if (key.startsWith('sf.')) return key.substring('sf.'.length);
+  return key;
+}
+
+function parseFieldOptions(optionsStr: string): Record<string, string> {
+  const options: Record<string, string> = {};
+  for (const opt of optionsStr.split(',')) {
+    const kv = opt.trim().match(/^((?:(?:sf|struct_frame)\.)?(\w+))\s*=\s*(.+)$/);
+    if (kv) options[normalizeFieldOptionKey(kv[1])] = kv[3].trim();
+  }
+  return options;
+}
 
 function parseDocument(uri: string, content: string): ParsedDocument {
   const lines = content.split('\n');
@@ -189,12 +221,15 @@ function parseDocument(uri: string, content: string): ParsedDocument {
     packageName: '',
     imports: [],
     messages: [],
-    enums: []
+    enums: [],
+    fileOptions: {},
+    fileOptionLines: {}
   };
 
   let currentMessage: MessageDefinition | null = null;
   let currentEnum: EnumDefinition | null = null;
   let currentNestedEnum: EnumDefinition | null = null;
+  let currentOneof: OneofDefinition | null = null;
   let braceDepth = 0;
 
   for (let i = 0; i < lines.length; i++) {
@@ -206,50 +241,62 @@ function parseDocument(uri: string, content: string): ParsedDocument {
 
     if (!trimmed) continue;
 
-    // Package declaration
-    const pkgMatch = trimmed.match(/^package\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;/);
-    if (pkgMatch) {
-      doc.packageName = pkgMatch[1];
-      continue;
-    }
+    if (braceDepth === 0) {
+      // Package declaration
+      const pkgMatch = trimmed.match(/^package\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;/);
+      if (pkgMatch) {
+        doc.packageName = pkgMatch[1];
+        continue;
+      }
 
-    // Import
-    const importMatch = trimmed.match(/^import\s+"([^"]+)"\s*;/);
-    if (importMatch) {
-      doc.imports.push(importMatch[1]);
-      continue;
-    }
+      // Import
+      const importMatch = trimmed.match(/^import\s+"([^"]+)"\s*;/);
+      if (importMatch) {
+        doc.imports.push(importMatch[1]);
+        continue;
+      }
 
-    // Message definition
-    const msgMatch = trimmed.match(/^message\s+([A-Z][a-zA-Z0-9_]*)\s*\{/);
-    if (msgMatch && braceDepth === 0) {
-      currentMessage = {
-        name: msgMatch[1],
-        line: i,
-        endLine: i,
-        fields: [],
-        options: {}
-      };
-      braceDepth = 1;
-      continue;
-    }
+      // File-level option (e.g. pkgid)
+      const fileOptMatch = trimmed.match(/^option\s+(\w+)\s*=\s*(.+?)\s*;/);
+      if (fileOptMatch) {
+        doc.fileOptions[fileOptMatch[1]] = fileOptMatch[2];
+        doc.fileOptionLines[fileOptMatch[1]] = i;
+        continue;
+      }
 
-    // Enum definition
-    const enumMatch = trimmed.match(/^enum\s+([A-Z][a-zA-Z0-9_]*)\s*\{/);
-    if (enumMatch && braceDepth === 0) {
-      currentEnum = {
-        name: enumMatch[1],
-        line: i,
-        endLine: i,
-        values: []
-      };
-      braceDepth = 1;
-      continue;
+      // Message definition
+      const msgMatch = trimmed.match(/^message\s+([A-Z][a-zA-Z0-9_]*)\s*\{/);
+      if (msgMatch) {
+        currentMessage = {
+          name: msgMatch[1],
+          line: i,
+          endLine: i,
+          fields: [],
+          oneofs: [],
+          options: {},
+          optionLines: {}
+        };
+        braceDepth = 1;
+        continue;
+      }
+
+      // Enum definition
+      const enumMatch = trimmed.match(/^enum\s+([A-Z][a-zA-Z0-9_]*)\s*\{/);
+      if (enumMatch) {
+        currentEnum = {
+          name: enumMatch[1],
+          line: i,
+          endLine: i,
+          values: []
+        };
+        braceDepth = 1;
+        continue;
+      }
     }
 
     if (braceDepth > 0) {
       // Detect nested enum start (inside a message, before counting braces)
-      if (currentMessage && !currentNestedEnum && braceDepth === 1) {
+      if (currentMessage && !currentNestedEnum && !currentOneof && braceDepth === 1) {
         const nestedEnumMatch = trimmed.match(/^enum\s+([A-Z][a-zA-Z0-9_]*)\s*\{/);
         if (nestedEnumMatch) {
           currentNestedEnum = {
@@ -258,6 +305,22 @@ function parseDocument(uri: string, content: string): ParsedDocument {
             line: i,
             endLine: i,
             values: []
+          };
+          braceDepth = 2;
+          continue;
+        }
+      }
+
+      // Detect oneof start (inside a message, before counting braces)
+      if (currentMessage && !currentNestedEnum && !currentOneof && braceDepth === 1) {
+        const oneofMatch = trimmed.match(/^oneof\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\{/);
+        if (oneofMatch) {
+          currentOneof = {
+            name: oneofMatch[1],
+            line: i,
+            endLine: i,
+            fields: [],
+            options: {}
           };
           braceDepth = 2;
           continue;
@@ -293,6 +356,14 @@ function parseDocument(uri: string, content: string): ParsedDocument {
         continue;
       }
 
+      // Oneof closing (depth went from 2 back to 1)
+      if (currentOneof && braceDepth === 1) {
+        currentOneof.endLine = i;
+        currentMessage!.oneofs.push(currentOneof);
+        currentOneof = null;
+        continue;
+      }
+
       if (currentNestedEnum) {
         // Nested enum value: supports both SCREAMING_SNAKE_CASE and PascalCase
         const enumValMatch = trimmed.match(/^([A-Za-z][A-Za-z0-9_]*)\s*=\s*([0-9]+)\s*;/);
@@ -300,6 +371,35 @@ function parseDocument(uri: string, content: string): ParsedDocument {
           currentNestedEnum.values.push({
             name: enumValMatch[1],
             value: parseInt(enumValMatch[2], 10),
+            line: i
+          });
+        }
+        continue;
+      }
+
+      if (currentOneof) {
+        // Option inside oneof (e.g. discriminator)
+        const optMatch = trimmed.match(/^option\s+(\w+)\s*=\s*(.+?)\s*;/);
+        if (optMatch) {
+          currentOneof.options[optMatch[1]] = optMatch[2];
+          continue;
+        }
+        // Field inside oneof
+        const fieldMatch = trimmed.match(
+          /^(repeated\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([0-9]+)\s*(?:\[([^\]]*)\])?\s*;/
+        );
+        if (fieldMatch) {
+          const repeated = !!fieldMatch[1];
+          const fieldType = fieldMatch[2];
+          const fieldName = fieldMatch[3];
+          const tag = parseInt(fieldMatch[4], 10);
+          const optionsStr = fieldMatch[5] || '';
+          currentOneof.fields.push({
+            name: fieldName,
+            type: fieldType,
+            tag,
+            repeated,
+            options: optionsStr ? parseFieldOptions(optionsStr) : {},
             line: i
           });
         }
@@ -324,6 +424,7 @@ function parseDocument(uri: string, content: string): ParsedDocument {
         const optMatch = trimmed.match(/^option\s+(\w+)\s*=\s*(.+?)\s*;/);
         if (optMatch) {
           currentMessage.options[optMatch[1]] = optMatch[2];
+          currentMessage.optionLines[optMatch[1]] = i;
           continue;
         }
 
@@ -338,19 +439,12 @@ function parseDocument(uri: string, content: string): ParsedDocument {
           const fieldName = fieldMatch[3];
           const tag = parseInt(fieldMatch[4], 10);
           const optionsStr = fieldMatch[5] || '';
-          const options: Record<string, string> = {};
-          if (optionsStr) {
-            for (const opt of optionsStr.split(',')) {
-              const kv = opt.trim().match(/^(\w+)\s*=\s*(.+)$/);
-              if (kv) options[kv[1]] = kv[2].trim();
-            }
-          }
           currentMessage.fields.push({
             name: fieldName,
             type: fieldType,
             tag,
             repeated,
-            options,
+            options: optionsStr ? parseFieldOptions(optionsStr) : {},
             line: i
           });
         }
@@ -359,6 +453,163 @@ function parseDocument(uri: string, content: string): ParsedDocument {
   }
 
   return doc;
+}
+
+function makeDiagnostic(line: number, message: string, severity: DiagnosticSeverity = DiagnosticSeverity.Error): Diagnostic {
+  return {
+    severity,
+    range: Range.create(line, 0, line, 10000),
+    message,
+    source: 'struct-frame'
+  };
+}
+
+function validateDocument(uri: string): void {
+  const parsed = getOrParseDocument(uri);
+  const diagnostics: Diagnostic[] = [];
+
+  // All known message names (including imports) for type resolution
+  const allDefs = getAllDefinitions(uri);
+  const messageNames = new Set(allDefs.messages.map(m => m.name));
+
+  // File-level: pkgid range 0–255
+  const pkgidStr = parsed.fileOptions['pkgid'];
+  let hasPkgid = false;
+  if (pkgidStr !== undefined) {
+    const pkgid = parseInt(pkgidStr, 10);
+    if (isNaN(pkgid) || pkgid < 0 || pkgid > 255) {
+      diagnostics.push(makeDiagnostic(
+        parsed.fileOptionLines['pkgid'] ?? 0,
+        `pkgid must be 0–255, got '${pkgidStr}'`
+      ));
+    } else {
+      hasPkgid = true;
+    }
+  }
+
+  const maxMsgid = hasPkgid ? 65535 : 255;
+  const msgidMap = new Map<number, string>(); // msgid value → message name
+
+  for (const msg of parsed.messages) {
+    // msgid range and uniqueness
+    const msgidStr = msg.options['msgid'];
+    if (msgidStr !== undefined) {
+      const msgid = parseInt(msgidStr, 10);
+      const optLine = msg.optionLines['msgid'] ?? msg.line;
+      if (isNaN(msgid) || msgid < 0 || msgid > maxMsgid) {
+        diagnostics.push(makeDiagnostic(optLine, `msgid must be 0–${maxMsgid}, got '${msgidStr}'`));
+      } else if (msgidMap.has(msgid)) {
+        diagnostics.push(makeDiagnostic(optLine,
+          `Duplicate msgid ${msgid} (already used by '${msgidMap.get(msgid)}')`));
+      } else {
+        msgidMap.set(msgid, msg.name);
+      }
+    }
+
+    // is_envelope: requires exactly 1 oneof; all oneof variants must be message types
+    if (msg.options['is_envelope'] === 'true') {
+      const optLine = msg.optionLines['is_envelope'] ?? msg.line;
+      if (msg.oneofs.length !== 1) {
+        diagnostics.push(makeDiagnostic(optLine,
+          `is_envelope requires exactly one oneof field (found ${msg.oneofs.length})`));
+      } else {
+        for (const field of msg.oneofs[0].fields) {
+          if (!messageNames.has(field.type)) {
+            diagnostics.push(makeDiagnostic(field.line,
+              `is_envelope: oneof variant '${field.name}' must be a message type (got '${field.type}')`));
+          }
+        }
+      }
+    }
+
+    // oneof discriminator validation
+    for (const oneof of msg.oneofs) {
+      const disc = oneof.options['discriminator'];
+      if (disc === 'msgid') {
+        for (const field of oneof.fields) {
+          const variantMsg = allDefs.messages.find(m => m.name === field.type);
+          if (!variantMsg) {
+            diagnostics.push(makeDiagnostic(field.line,
+              `discriminator=msgid: variant '${field.name}' type '${field.type}' is not a known message`));
+          } else if (!variantMsg.options['msgid']) {
+            diagnostics.push(makeDiagnostic(field.line,
+              `discriminator=msgid: variant '${field.name}' (type '${field.type}') does not have msgid`));
+          }
+        }
+      }
+    }
+
+    // Field-level validation
+    for (const field of msg.fields) {
+      const hasSize = 'size' in field.options;
+      const hasMaxSize = 'max_size' in field.options;
+      const hasElementSize = 'element_size' in field.options;
+
+      if (field.type === 'string' && !field.repeated) {
+        // Plain string: exactly one of size or max_size
+        if (!hasSize && !hasMaxSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `String field '${field.name}' requires [size=N] or [max_size=N]`));
+        } else if (hasSize && hasMaxSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `String field '${field.name}' cannot have both size and max_size`));
+        }
+        if (hasElementSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `element_size is only valid on repeated string fields`));
+        }
+      } else if (field.type === 'string' && field.repeated) {
+        // repeated string: size/max_size AND element_size
+        if (!hasSize && !hasMaxSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `Repeated string field '${field.name}' requires [size=N] or [max_size=N]`));
+        } else if (hasSize && hasMaxSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `Repeated string field '${field.name}' cannot have both size and max_size`));
+        }
+        if (!hasElementSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `Repeated string field '${field.name}' requires [element_size=M]`));
+        }
+      } else if (field.repeated && PRIMITIVE_TYPES.includes(field.type)) {
+        // repeated primitive (array): size or max_size
+        if (!hasSize && !hasMaxSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `Repeated field '${field.name}' requires [size=N] or [max_size=N]`));
+        } else if (hasSize && hasMaxSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `Repeated field '${field.name}' cannot have both size and max_size`));
+        }
+        if (hasElementSize) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `element_size is only valid on repeated string fields`));
+        }
+      }
+
+      // flatten: only on message-type fields; check name collisions with parent
+      if (field.options['flatten'] === 'true') {
+        if (!messageNames.has(field.type)) {
+          diagnostics.push(makeDiagnostic(field.line,
+            `flatten is only valid on message-type fields ('${field.type}' is not a known message)`));
+        } else {
+          const nestedMsg = allDefs.messages.find(m => m.name === field.type);
+          if (nestedMsg) {
+            const parentFieldNames = new Set(
+              msg.fields.filter(f => f.name !== field.name).map(f => f.name)
+            );
+            for (const nf of nestedMsg.fields) {
+              if (parentFieldNames.has(nf.name)) {
+                diagnostics.push(makeDiagnostic(field.line,
+                  `flatten: field '${nf.name}' from '${field.type}' collides with existing field in '${msg.name}'`));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  connection.sendDiagnostics({ uri, diagnostics });
 }
 
 function getOrParseDocument(uri: string): ParsedDocument {
@@ -378,7 +629,7 @@ function getOrParseDocument(uri: string): ParsedDocument {
       connection.console.log(`getOrParseDocument: read from filesystem '${filePath}'`);
     } catch (err) {
       connection.console.error(`getOrParseDocument: could not read '${uri}': ${err}`);
-      return { uri, packageName: '', imports: [], messages: [], enums: [] };
+      return { uri, packageName: '', imports: [], messages: [], enums: [], fileOptions: {}, fileOptionLines: {} };
     }
   }
 
@@ -470,7 +721,7 @@ connection.onInitialize((params: InitializeParams) => {
 });
 
 connection.onInitialized(async () => {
-  connection.console.log('Struct Frame language server initialized.');
+  connection.console.log('Struct Frame LS initialized.');
   if (hasConfigurationCapability) {
     connection.client.register(DidChangeConfigurationNotification.type, undefined);
   }
@@ -496,11 +747,12 @@ connection.onDidChangeWatchedFiles(params => {
 
 documents.onDidChangeContent(change => {
   parsedDocuments.delete(change.document.uri);
-  getOrParseDocument(change.document.uri);
+  validateDocument(change.document.uri);
 });
 
 documents.onDidClose(e => {
   parsedDocuments.delete(e.document.uri);
+  connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
 });
 
 // Completion
@@ -546,6 +798,14 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
   const bracketStart = lineUpToCursor.lastIndexOf('[');
   const bracketEnd = lineUpToCursor.lastIndexOf(']');
   if (bracketStart > bracketEnd && bracketStart >= 0) {
+    const afterBracket = lineUpToCursor.substring(bracketStart + 1);
+    // Value completion for flatten= (boolean)
+    if (/(?:^|,)\s*(?:(?:sf|struct_frame)\.)?flatten\s*=\s*$/.test(afterBracket)) {
+      return [
+        { label: 'true', kind: CompletionItemKind.Value },
+        { label: 'false', kind: CompletionItemKind.Value }
+      ];
+    }
     return FIELD_OPTION_NAMES.map(opt => ({
       label: opt,
       kind: CompletionItemKind.Property,
@@ -553,13 +813,41 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
     }));
   }
 
+  // Context detection for option completion
+  const parsed = getOrParseDocument(params.textDocument.uri);
+  const lineNum = params.position.line;
+  const inOneof = parsed.messages.some(m =>
+    lineNum > m.line && lineNum < m.endLine &&
+    m.oneofs.some(o => lineNum > o.line && lineNum < o.endLine)
+  );
+  const inMessage = !inOneof && parsed.messages.some(m => lineNum > m.line && lineNum < m.endLine);
+
   // After "option "
   if (/^\s*option\s+$/.test(lineUpToCursor)) {
-    return OPTION_NAMES.map(opt => ({
+    const optNames = inOneof ? ONEOF_OPTION_NAMES : inMessage ? MESSAGE_OPTION_NAMES : FILE_OPTION_NAMES;
+    return optNames.map(opt => ({
       label: opt,
       kind: CompletionItemKind.Property,
       detail: 'Option name'
     }));
+  }
+
+  // After "option discriminator ="
+  if (/^\s*option\s+discriminator\s*=\s*$/.test(lineUpToCursor)) {
+    return DISCRIMINATOR_VALUES.map(v => ({
+      label: v,
+      kind: CompletionItemKind.EnumMember,
+      detail: 'Discriminator mode',
+      insertText: `"${v}"`
+    }));
+  }
+
+  // After "option variable =" or "option is_envelope ="
+  if (/^\s*option\s+(variable|is_envelope)\s*=\s*$/.test(lineUpToCursor)) {
+    return [
+      { label: 'true', kind: CompletionItemKind.Value },
+      { label: 'false', kind: CompletionItemKind.Value }
+    ];
   }
 
   // After "option msgid =" or "option pkgid ="
@@ -582,14 +870,14 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
     return items;
   }
 
-  // Check if we're inside a message
-  const parsed = getOrParseDocument(params.textDocument.uri);
-  const lineNum = params.position.line;
+  // Typing the name of an oneof block — no completions needed
+  if (/^\s*oneof\s+/.test(lineUpToCursor)) {
+    return [];
+  }
 
-  const inMessage = parsed.messages.some(m => lineNum > m.line && lineNum < m.endLine);
   const inEnum = parsed.enums.some(e => lineNum > e.line && lineNum < e.endLine);
 
-  if (inMessage && !inEnum) {
+  if ((inMessage || inOneof) && !inEnum) {
     const isAfterRepeated = /^\s*repeated\s+$/.test(lineUpToCursor);
     const isAtTypePosition = /^\s*(repeated\s+)?$/.test(lineUpToCursor) || isAfterRepeated;
 
@@ -618,12 +906,12 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
       return [...primitiveItems, ...messageItems, ...enumItems, ...getCompileConfigCompletionItems(allDefs)];
     }
 
-    // Inside message, at start of line - suggest keywords for inside message
+    // Inside message/oneof, at start of line - suggest keywords
     if (/^\s*$/.test(lineUpToCursor)) {
       const insideMessageKeywords: CompletionItem[] = [
         { label: 'option', kind: CompletionItemKind.Keyword },
         { label: 'repeated', kind: CompletionItemKind.Keyword },
-        { label: 'oneof', kind: CompletionItemKind.Keyword }
+        ...(inMessage && !inOneof ? [{ label: 'oneof', kind: CompletionItemKind.Keyword }] : [])
       ];
       const allDefs = getAllDefinitions(params.textDocument.uri);
       const primitiveItems: CompletionItem[] = PRIMITIVE_TYPES.map(t => ({
@@ -666,6 +954,27 @@ connection.onDefinition((params: TextDocumentPositionParams): Definition | null 
 
   const { word } = wordInfo;
 
+  // Oneof name go-to-definition → navigate to generated companion enum files
+  {
+    const parsed = getOrParseDocument(params.textDocument.uri);
+    for (const msg of parsed.messages) {
+      const oneof = msg.oneofs.find(o => o.name === word);
+      if (oneof) {
+        const rawDisc = (oneof.options['discriminator'] ?? 'auto').replace(/"/g, '');
+        if (rawDisc !== 'none') {
+          const enumName = word.charAt(0).toUpperCase() + word.slice(1);
+          const enumEntry = sfCompileConfig?.enums.find(e => e.name === enumName) ?? null;
+          if (enumEntry) {
+            const locs = findGeneratedFileLocations(enumName);
+            if (locs.length === 1) return locs[0];
+            if (locs.length > 1) return locs;
+          }
+        }
+        return null;
+      }
+    }
+  }
+
   // Only look up PascalCase identifiers (user-defined types)
   if (!/^[A-Z]/.test(word)) return null;
 
@@ -685,6 +994,14 @@ connection.onDefinition((params: TextDocumentPositionParams): Definition | null 
     const enm = parsed.enums.find(e => e.name === word);
     if (enm) {
       return Location.create(uri, Range.create(enm.line, 0, enm.line, word.length + 5));
+    }
+
+    // Search enum values (e.g. SCREAMING_SNAKE_CASE members)
+    for (const e of parsed.enums) {
+      const val = e.values.find(v => v.name === word);
+      if (val) {
+        return Location.create(uri, Range.create(val.line, 0, val.line, word.length));
+      }
     }
 
     for (const imp of parsed.imports) {
@@ -714,7 +1031,7 @@ connection.onDefinition((params: TextDocumentPositionParams): Definition | null 
     return generatedLocations;
   } else {
     // Field type reference → navigate to .sf definition only
-    const result = sfLocation || findSfSourceLocation(word);
+    const result = sfLocation || findSfSourceLocation(word) || findEnumValueInCompileConfigSources(word);
     if (!result) {
       connection.console.warn(`onDefinition: could not resolve definition for '${word}' (not found in .sf files or compile config).`);
     }
@@ -766,6 +1083,33 @@ function findSfSourceLocation(word: string): Location | null {
   const enm = parsed.enums.find(e => e.name === word);
   if (enm) return Location.create(sourceUri, Range.create(enm.line, 0, enm.line, word.length + 5));
   connection.console.warn(`findSfSourceLocation('${word}'): definition not found in '${sourceFilePath}'.`);
+  return null;
+}
+
+function findEnumValueInCompileConfigSources(word: string): Location | null {
+  if (!sfCompileConfig) return null;
+  const sourceDir = getCompileConfigSourceDir();
+  if (!sourceDir) return null;
+  const seenFiles = new Set<string>();
+  for (const enumEntry of sfCompileConfig.enums) {
+    if (!enumEntry.source_file) continue;
+    const sourceFilePath = path.resolve(sourceDir, enumEntry.source_file);
+    if (seenFiles.has(sourceFilePath)) continue;
+    seenFiles.add(sourceFilePath);
+    try {
+      if (!fs.statSync(sourceFilePath).isFile()) continue;
+    } catch {
+      continue;
+    }
+    const sourceUri = pathToFileURL(sourceFilePath).toString();
+    const parsed = getOrParseDocument(sourceUri);
+    for (const e of parsed.enums) {
+      const val = e.values.find(v => v.name === word);
+      if (val) {
+        return Location.create(sourceUri, Range.create(val.line, 0, val.line, word.length));
+      }
+    }
+  }
   return null;
 }
 
@@ -906,6 +1250,82 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
         contents: {
           kind: MarkupKind.Markdown,
           value: `**${kind} ${word}** (package: \`${compileEntry.package}\`)${parentNote}${generatedSection}`
+        }
+      };
+    }
+  }
+
+  // Oneof name hover — show generated discriminator enum
+  {
+    const parsed = getOrParseDocument(params.textDocument.uri);
+    for (const msg of parsed.messages) {
+      const oneof = msg.oneofs.find(o => o.name === word);
+      if (!oneof) continue;
+
+      const rawDisc = (oneof.options['discriminator'] ?? 'auto').replace(/"/g, '');
+      const enumName = word.charAt(0).toUpperCase() + word.slice(1);
+
+      // Look up the companion enum in the compile config (generated for field_order/auto)
+      const compileEntry = sfCompileConfig?.enums.find(e => e.name === enumName) ?? null;
+      const generatedSection = compileEntry ? buildGeneratedFilesMarkdown(compileEntry) : '';
+
+      if (rawDisc === 'none') {
+        return {
+          contents: {
+            kind: MarkupKind.Markdown,
+            value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`none\` — no companion enum generated`
+          }
+        };
+      }
+
+      if (rawDisc === 'msgid') {
+        const allDefs = getAllDefinitions(params.textDocument.uri);
+        const variantLines = oneof.fields.map(f => {
+          const variantMsg = allDefs.messages.find(m => m.name === f.type);
+          const id = variantMsg?.options['msgid'] ?? '?';
+          return `  // msgid ${id}\n  ${f.type} ${f.name};`;
+        }).join('\n');
+        return {
+          contents: {
+            kind: MarkupKind.Markdown,
+            value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`msgid\` (uint16)\n\n\`\`\`sf\noneof ${word} {\n${variantLines}\n}\n\`\`\`${generatedSection}`
+          }
+        };
+      }
+
+      // field_order or auto — build 1-based companion enum
+      let effectiveMode = rawDisc;
+      if (rawDisc === 'auto') {
+        const allDefs = getAllDefinitions(params.textDocument.uri);
+        const allHaveMsgid = oneof.fields.every(f => {
+          const vm = allDefs.messages.find(m => m.name === f.type);
+          return !!vm?.options['msgid'];
+        });
+        effectiveMode = allHaveMsgid ? 'msgid' : 'field_order';
+        // If auto resolves to msgid, re-render as msgid
+        if (effectiveMode === 'msgid') {
+          const variantLines = oneof.fields.map(f => {
+            const variantMsg = allDefs.messages.find(m => m.name === f.type);
+            const id = variantMsg?.options['msgid'] ?? '?';
+            return `  // msgid ${id}\n  ${f.type} ${f.name};`;
+          }).join('\n');
+          return {
+            contents: {
+              kind: MarkupKind.Markdown,
+              value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`auto\` → \`msgid\` (uint16)\n\n\`\`\`sf\noneof ${word} {\n${variantLines}\n}\n\`\`\`${generatedSection}`
+            }
+          };
+        }
+      }
+
+      // field_order: generate 1-based companion enum
+      const valueLines = oneof.fields.map((f, idx) =>
+        `  ${f.name.replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase()} = ${idx + 1};`
+      ).join('\n');
+      return {
+        contents: {
+          kind: MarkupKind.Markdown,
+          value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`${rawDisc}\`${rawDisc === 'auto' ? ' → `field_order`' : ''} (uint8)\n\n**Generated companion enum:**\n\`\`\`sf\nenum ${enumName} {\n${valueLines}\n}\n\`\`\`${generatedSection}`
         }
       };
     }
