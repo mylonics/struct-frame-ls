@@ -2,7 +2,7 @@
   "name": "struct-frame-ls",
   "displayName": "Struct Frame Language Support",
   "description": "Language support for struct-frame (.sf) files",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "license": "Apache-2.0",
   "publisher": "mylonics",
   "icon": "icon.png",
