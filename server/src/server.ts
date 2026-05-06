@@ -55,6 +55,7 @@ interface EnumDefinition {
   line: number;
   endLine: number;
   values: EnumValue[];
+  parentMessage?: string;
 }
 
 interface ParsedDocument {
@@ -85,6 +86,7 @@ interface SfCompileEntry {
   package: string;
   source_file: string;
   generated_files: SfCompileGeneratedFiles;
+  parent_message?: string;
 }
 
 interface SfCompileConfig {
@@ -192,6 +194,7 @@ function parseDocument(uri: string, content: string): ParsedDocument {
 
   let currentMessage: MessageDefinition | null = null;
   let currentEnum: EnumDefinition | null = null;
+  let currentNestedEnum: EnumDefinition | null = null;
   let braceDepth = 0;
 
   for (let i = 0; i < lines.length; i++) {
@@ -245,6 +248,22 @@ function parseDocument(uri: string, content: string): ParsedDocument {
     }
 
     if (braceDepth > 0) {
+      // Detect nested enum start (inside a message, before counting braces)
+      if (currentMessage && !currentNestedEnum && braceDepth === 1) {
+        const nestedEnumMatch = trimmed.match(/^enum\s+([A-Z][a-zA-Z0-9_]*)\s*\{/);
+        if (nestedEnumMatch) {
+          currentNestedEnum = {
+            name: nestedEnumMatch[1],
+            parentMessage: currentMessage.name,
+            line: i,
+            endLine: i,
+            values: []
+          };
+          braceDepth = 2;
+          continue;
+        }
+      }
+
       // Count braces
       for (const ch of trimmed) {
         if (ch === '{') braceDepth++;
@@ -266,9 +285,30 @@ function parseDocument(uri: string, content: string): ParsedDocument {
         continue;
       }
 
+      // Nested enum closing (depth went from 2 back to 1)
+      if (currentNestedEnum && braceDepth === 1) {
+        currentNestedEnum.endLine = i;
+        doc.enums.push(currentNestedEnum);
+        currentNestedEnum = null;
+        continue;
+      }
+
+      if (currentNestedEnum) {
+        // Nested enum value: supports both SCREAMING_SNAKE_CASE and PascalCase
+        const enumValMatch = trimmed.match(/^([A-Za-z][A-Za-z0-9_]*)\s*=\s*([0-9]+)\s*;/);
+        if (enumValMatch) {
+          currentNestedEnum.values.push({
+            name: enumValMatch[1],
+            value: parseInt(enumValMatch[2], 10),
+            line: i
+          });
+        }
+        continue;
+      }
+
       if (currentEnum) {
-        // Enum value: VALUE_NAME = number;
-        const enumValMatch = trimmed.match(/^([A-Z][A-Z0-9_]*)\s*=\s*([0-9]+)\s*;/);
+        // Enum value: supports both SCREAMING_SNAKE_CASE and PascalCase
+        const enumValMatch = trimmed.match(/^([A-Za-z][A-Za-z0-9_]*)\s*=\s*([0-9]+)\s*;/);
         if (enumValMatch) {
           currentEnum.values.push({
             name: enumValMatch[1],
@@ -483,7 +523,10 @@ function getCompileConfigCompletionItems(existingDefs: { messages: MessageDefini
   }
   for (const entry of sfCompileConfig.enums) {
     if (!existingNames.has(entry.name)) {
-      items.push({ label: entry.name, kind: CompletionItemKind.Enum, detail: `Enum (${entry.package})` });
+      const detail = entry.parent_message
+        ? `Nested enum (${entry.package}, in ${entry.parent_message})`
+        : `Enum (${entry.package})`;
+      items.push({ label: entry.name, kind: CompletionItemKind.Enum, detail });
     }
   }
   return items;
@@ -840,7 +883,7 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
         return {
           contents: {
             kind: MarkupKind.Markdown,
-            value: `**enum ${word}**${generatedSection}`
+            value: `**enum ${word}**${enm.parentMessage ? ` (nested in \`${enm.parentMessage}\`)` : ''}${generatedSection}`
           }
         };
       }
@@ -848,7 +891,7 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
       return {
         contents: {
           kind: MarkupKind.Markdown,
-          value: `**enum ${word}**\n\`\`\`sf\nenum ${word} {\n${valueLines}\n}\n\`\`\`${generatedSection}`
+          value: `**enum ${word}**${enm.parentMessage ? ` (nested in \`${enm.parentMessage}\`)` : ''}\n\`\`\`sf\nenum ${word} {\n${valueLines}\n}\n\`\`\`${generatedSection}`
         }
       };
     }
@@ -858,10 +901,11 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
     if (compileEntry) {
       const generatedSection = buildGeneratedFilesMarkdown(compileEntry);
       const kind = isEnumInCompileConfig(word) ? 'enum' : 'message';
+      const parentNote = compileEntry.parent_message ? ` (nested in \`${compileEntry.parent_message}\`)` : '';
       return {
         contents: {
           kind: MarkupKind.Markdown,
-          value: `**${kind} ${word}** (package: \`${compileEntry.package}\`)${generatedSection}`
+          value: `**${kind} ${word}** (package: \`${compileEntry.package}\`)${parentNote}${generatedSection}`
         }
       };
     }
@@ -878,6 +922,7 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
   const parsed = getOrParseDocument(params.textDocument.uri);
   const symbols: DocumentSymbol[] = [];
 
+  const msgSymbolMap = new Map<string, DocumentSymbol>();
   for (const msg of parsed.messages) {
     const msgRange = Range.create(msg.line, 0, msg.endLine + 1, 0);
     const msgSymbol: DocumentSymbol = {
@@ -893,6 +938,7 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
         selectionRange: Range.create(f.line, 0, f.line, f.name.length)
       }))
     };
+    msgSymbolMap.set(msg.name, msgSymbol);
     symbols.push(msgSymbol);
   }
 
@@ -911,6 +957,13 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
         selectionRange: Range.create(v.line, 0, v.line, v.name.length)
       }))
     };
+    if (enm.parentMessage) {
+      const parentSymbol = msgSymbolMap.get(enm.parentMessage);
+      if (parentSymbol) {
+        parentSymbol.children!.push(enumSymbol);
+        continue;
+      }
+    }
     symbols.push(enumSymbol);
   }
 
