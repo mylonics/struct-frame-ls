@@ -541,6 +541,69 @@ function validateDocument(uri: string): void {
   const allDefs = getAllDefinitions(uri);
   const messageNames = new Set(allDefs.messages.map(m => m.name));
 
+  // Within-file: duplicate message names (includes nested messages flattened into doc.messages)
+  {
+    const seenMsgNames = new Map<string, number>(); // name → first definition line
+    for (const msg of parsed.messages) {
+      if (seenMsgNames.has(msg.name)) {
+        diagnostics.push(makeDiagnostic(msg.line,
+          `Duplicate message name '${msg.name}' (already defined at line ${seenMsgNames.get(msg.name)! + 1})`));
+      } else {
+        seenMsgNames.set(msg.name, msg.line);
+      }
+    }
+  }
+
+  // Within-file: duplicate enum names
+  {
+    const seenEnumNames = new Map<string, number>(); // name → first definition line
+    for (const enm of parsed.enums) {
+      if (seenEnumNames.has(enm.name)) {
+        diagnostics.push(makeDiagnostic(enm.line,
+          `Duplicate enum name '${enm.name}' (already defined at line ${seenEnumNames.get(enm.name)! + 1})`));
+      } else {
+        seenEnumNames.set(enm.name, enm.line);
+      }
+    }
+  }
+
+  // Within-file: message name conflicts with enum name (same name declared as both)
+  {
+    const enumNameLines = new Map(parsed.enums.map(e => [e.name, e.line]));
+    for (const msg of parsed.messages) {
+      if (enumNameLines.has(msg.name)) {
+        diagnostics.push(makeDiagnostic(msg.line,
+          `Name conflict: '${msg.name}' is declared as both a message and an enum in this file`));
+      }
+    }
+  }
+
+  // Build cross-file imported def maps for msgid and name conflict checks
+  const importedMsgidMap = new Map<number, { name: string; file: string }>();
+  const importedMsgNames = new Map<string, string>(); // name → short filename
+  const importedEnumNames = new Map<string, string>();
+  {
+    const allDefsWithSource = getAllDefsWithSource(uri);
+    for (const { msg, sourceUri } of allDefsWithSource.messages) {
+      if (sourceUri === uri) continue;
+      const shortFile = path.basename(sourceUri.startsWith('file://') ? fileURLToPath(sourceUri) : sourceUri);
+      if (!importedMsgNames.has(msg.name)) {
+        importedMsgNames.set(msg.name, shortFile);
+      }
+      const mid = parseInt(msg.options['msgid'] ?? '', 10);
+      if (!isNaN(mid) && mid >= 0 && !importedMsgidMap.has(mid)) {
+        importedMsgidMap.set(mid, { name: msg.name, file: shortFile });
+      }
+    }
+    for (const { enm, sourceUri } of allDefsWithSource.enums) {
+      if (sourceUri === uri) continue;
+      const shortFile = path.basename(sourceUri.startsWith('file://') ? fileURLToPath(sourceUri) : sourceUri);
+      if (!importedEnumNames.has(enm.name)) {
+        importedEnumNames.set(enm.name, shortFile);
+      }
+    }
+  }
+
   // File-level: unknown option names
   const VALID_FILE_OPTIONS = new Set(['pkgid']);
   for (const optName of Object.keys(parsed.fileOptions)) {
@@ -582,6 +645,10 @@ function validateDocument(uri: string): void {
       } else if (msgidMap.has(msgid)) {
         diagnostics.push(makeDiagnostic(optLine,
           `Duplicate msgid ${msgid} (already used by '${msgidMap.get(msgid)}')`));
+      } else if (importedMsgidMap.has(msgid)) {
+        const imp = importedMsgidMap.get(msgid)!;
+        diagnostics.push(makeDiagnostic(optLine,
+          `Duplicate msgid ${msgid} (already used by '${imp.name}' in '${imp.file}')`));
       } else {
         msgidMap.set(msgid, msg.name);
       }
@@ -816,6 +883,30 @@ function validateDocument(uri: string): void {
     }
   }
 
+  // Cross-file: name conflicts between current file and imported files
+  for (const msg of parsed.messages) {
+    if (importedMsgNames.has(msg.name)) {
+      diagnostics.push(makeDiagnostic(msg.line,
+        `Name conflict: message '${msg.name}' is also defined in '${importedMsgNames.get(msg.name)}'`,
+        DiagnosticSeverity.Warning));
+    }
+    if (importedEnumNames.has(msg.name)) {
+      diagnostics.push(makeDiagnostic(msg.line,
+        `Name conflict: '${msg.name}' is declared as a message here but as an enum in '${importedEnumNames.get(msg.name)}'`));
+    }
+  }
+  for (const enm of parsed.enums) {
+    if (importedEnumNames.has(enm.name)) {
+      diagnostics.push(makeDiagnostic(enm.line,
+        `Name conflict: enum '${enm.name}' is also defined in '${importedEnumNames.get(enm.name)}'`,
+        DiagnosticSeverity.Warning));
+    }
+    if (importedMsgNames.has(enm.name)) {
+      diagnostics.push(makeDiagnostic(enm.line,
+        `Name conflict: '${enm.name}' is declared as an enum here but as a message in '${importedMsgNames.get(enm.name)}'`));
+    }
+  }
+
   // Enum value number uniqueness
   for (const enm of parsed.enums) {
     const valueNumMap = new Map<number, string>();
@@ -894,6 +985,26 @@ function getAllDefinitions(uri: string, visited = new Set<string>()): { messages
     result.enums.push(...imported.enums);
   }
 
+  return result;
+}
+
+function getAllDefsWithSource(uri: string, visited = new Set<string>()): {
+  messages: { msg: MessageDefinition; sourceUri: string }[];
+  enums: { enm: EnumDefinition; sourceUri: string }[];
+} {
+  if (visited.has(uri)) return { messages: [], enums: [] };
+  visited.add(uri);
+  const parsed = getOrParseDocument(uri);
+  const result = {
+    messages: parsed.messages.map(msg => ({ msg, sourceUri: uri })),
+    enums: parsed.enums.map(enm => ({ enm, sourceUri: uri }))
+  };
+  for (const imp of parsed.imports) {
+    const importUri = resolveImportUri(imp, uri);
+    const imported = getAllDefsWithSource(importUri, visited);
+    result.messages.push(...imported.messages);
+    result.enums.push(...imported.enums);
+  }
   return result;
 }
 
