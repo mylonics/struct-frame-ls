@@ -5,6 +5,7 @@
   "version": "0.1.3",
   "license": "Apache-2.0",
   "publisher": "mylonics",
+  "icon": "icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/mylonics/struct-frame-ls.git"
