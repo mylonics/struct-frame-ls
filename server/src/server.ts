@@ -1469,7 +1469,7 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
         : allTags;
       if (scopeTags.length > 0) {
         const maxTag = Math.max(...scopeTags);
-        const suggested = maxTag + 1 > 2 ? maxTag : 2;
+        const suggested = Math.max(maxTag + 1, 2);
         return [{ label: String(suggested), kind: CompletionItemKind.Value, detail: 'First extension field number' }];
       }
     }
