@@ -54,6 +54,7 @@ interface OneofDefinition {
   endLine: number;
   fields: FieldDefinition[];
   options: Record<string, string>;
+  optionLines: Record<string, number>;
 }
 
 interface MessageDefinition {
@@ -209,8 +210,8 @@ const PRIMITIVE_TYPE_DOCS: Record<string, string> = {
 
 const KEYWORDS = ['package', 'import', 'option', 'message', 'enum', 'repeated', 'oneof'];
 const FILE_OPTION_NAMES = ['pkgid'];
-const MESSAGE_OPTION_NAMES = ['msgid', 'variable', 'is_envelope'];
-const ONEOF_OPTION_NAMES = ['discriminator'];
+const MESSAGE_OPTION_NAMES = ['msgid', 'variable', 'is_envelope', 'extensions_start', 'magic_bytes'];
+const ONEOF_OPTION_NAMES = ['discriminator', 'extensions_start'];
 const DISCRIMINATOR_VALUES = ['auto', 'msgid', 'field_order', 'none'];
 const FIELD_OPTION_NAMES = ['size=', 'max_size=', 'element_size=', 'flatten='];
 
@@ -358,7 +359,8 @@ function parseDocument(uri: string, content: string): ParsedDocument {
             line: i,
             endLine: i,
             fields: [],
-            options: {}
+            options: {},
+            optionLines: {}
           };
           braceDepth = 2;
           continue;
@@ -454,6 +456,7 @@ function parseDocument(uri: string, content: string): ParsedDocument {
         const optMatch = trimmed.match(/^option\s+(\w+)\s*=\s*(.+?)\s*;/);
         if (optMatch) {
           currentOneof.options[optMatch[1]] = optMatch[2];
+          currentOneof.optionLines[optMatch[1]] = i;
           continue;
         }
         // Field inside oneof
@@ -686,7 +689,7 @@ function validateDocument(uri: string): void {
     }
 
     // Unknown message-level option names
-    const VALID_MSG_OPTIONS = new Set(['msgid', 'variable', 'is_envelope']);
+    const VALID_MSG_OPTIONS = new Set(['msgid', 'variable', 'is_envelope', 'extensions_start', 'magic_bytes']);
     for (const optName of Object.keys(msg.options)) {
       if (!VALID_MSG_OPTIONS.has(optName)) {
         diagnostics.push(makeDiagnostic(
@@ -733,16 +736,76 @@ function validateDocument(uri: string): void {
         `option is_envelope must be 'true' or 'false', got '${msg.options['is_envelope']}'`));
     }
 
+    // magic_bytes validation: "0xAB, 0xCD" or "171, 205" — exactly two values, each 1–255
+    if (msg.options['magic_bytes'] !== undefined) {
+      const mbRaw = msg.options['magic_bytes'].replace(/^"|"$/g, '').trim();
+      const mbParts = mbRaw.split(',').map(s => s.trim());
+      const optLine = msg.optionLines['magic_bytes'] ?? msg.line;
+      if (mbParts.length !== 2) {
+        diagnostics.push(makeDiagnostic(optLine,
+          `option magic_bytes requires exactly two comma-separated values, e.g. "0xA3, 0x7F"`));
+      } else {
+        for (const part of mbParts) {
+          const val = part.startsWith('0x') || part.startsWith('0X')
+            ? parseInt(part, 16)
+            : parseInt(part, 10);
+          if (isNaN(val) || val < 1 || val > 255) {
+            diagnostics.push(makeDiagnostic(optLine,
+              `option magic_bytes: each value must be 1–255 (hex or decimal), got '${part}'`));
+          }
+        }
+      }
+    }
+
+    // message-level extensions_start validation
+    if (msg.options['extensions_start'] !== undefined) {
+      const extStartStr = msg.options['extensions_start'];
+      const extStart = parseInt(extStartStr, 10);
+      const optLine = msg.optionLines['extensions_start'] ?? msg.line;
+      if (isNaN(extStart) || extStart < 2) {
+        diagnostics.push(makeDiagnostic(optLine,
+          `option extensions_start must be an integer ≥ 2, got '${extStartStr}'`));
+      } else {
+        const allFieldTags = new Set([
+          ...msg.fields.map(f => f.tag),
+          ...msg.oneofs.flatMap(o => o.fields.map(f => f.tag))
+        ]);
+        if (!allFieldTags.has(extStart)) {
+          diagnostics.push(makeDiagnostic(optLine,
+            `option extensions_start=${extStart} must equal an existing field number in '${msg.name}'`));
+        }
+      }
+    }
+
     // Unknown oneof-level option names
-    const VALID_ONEOF_OPTIONS = new Set(['discriminator']);
+    const VALID_ONEOF_OPTIONS = new Set(['discriminator', 'extensions_start']);
     for (const oneof of msg.oneofs) {
       for (const optName of Object.keys(oneof.options)) {
         if (!VALID_ONEOF_OPTIONS.has(optName)) {
           diagnostics.push(makeDiagnostic(
-            oneof.line,
+            oneof.optionLines[optName] ?? oneof.line,
             `Unknown oneof option '${optName}'. Valid options: ${[...VALID_ONEOF_OPTIONS].join(', ')}`,
             DiagnosticSeverity.Warning
           ));
+        }
+      }
+    }
+
+    // oneof extensions_start validation
+    for (const oneof of msg.oneofs) {
+      if (oneof.options['extensions_start'] !== undefined) {
+        const extStartStr = oneof.options['extensions_start'];
+        const extStart = parseInt(extStartStr, 10);
+        const optLine = oneof.optionLines['extensions_start'] ?? oneof.line;
+        if (isNaN(extStart) || extStart < 2) {
+          diagnostics.push(makeDiagnostic(optLine,
+            `option extensions_start must be an integer ≥ 2, got '${extStartStr}'`));
+        } else {
+          const oneofTags = new Set(oneof.fields.map(f => f.tag));
+          if (!oneofTags.has(extStart)) {
+            diagnostics.push(makeDiagnostic(optLine,
+              `option extensions_start=${extStart} must equal an existing field number in oneof '${oneof.name}'`));
+          }
         }
       }
     }
@@ -773,13 +836,15 @@ function validateDocument(uri: string): void {
       }
     }
 
-    // Field number uniqueness within message (fields + all oneof variants share the same namespace)
+    // Field number uniqueness and sequential validation (1..N, no gaps, no duplicates)
     {
       const allTags = new Map<number, string>();
+      let hasDuplicates = false;
       for (const field of msg.fields) {
         if (allTags.has(field.tag)) {
           diagnostics.push(makeDiagnostic(field.line,
             `Duplicate field number ${field.tag} in '${msg.name}' (already used by '${allTags.get(field.tag)}')`));
+          hasDuplicates = true;
         } else {
           allTags.set(field.tag, field.name);
         }
@@ -789,8 +854,19 @@ function validateDocument(uri: string): void {
           if (allTags.has(field.tag)) {
             diagnostics.push(makeDiagnostic(field.line,
               `Duplicate field number ${field.tag} in '${msg.name}' (already used by '${allTags.get(field.tag)}')`));
+            hasDuplicates = true;
           } else {
             allTags.set(field.tag, field.name);
+          }
+        }
+      }
+      // Check that field numbers form a contiguous sequence starting at 1 (no gaps)
+      if (!hasDuplicates && allTags.size > 0) {
+        const maxTag = Math.max(...allTags.keys());
+        for (let n = 1; n <= maxTag; n++) {
+          if (!allTags.has(n)) {
+            diagnostics.push(makeDiagnostic(msg.line,
+              `Field numbers in '${msg.name}' must be sequential starting at 1; field number ${n} is missing`));
           }
         }
       }
@@ -1335,6 +1411,8 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
       variable: 'Enables variable-length encoding. Bounded (`max_size`) fields only transmit used bytes, reducing bandwidth.',
       is_envelope: 'Marks this message as a container/envelope. Must have exactly one `oneof` whose variants are all message types.',
       discriminator: 'Controls how the active oneof variant is identified: `"auto"` | `"msgid"` | `"field_order"` | `"none"`.',
+      extensions_start: 'First extension field number (≥ 2). Fields with this number or higher are extension fields; older receivers zero-fill them.',
+      magic_bytes: 'Override the auto-calculated magic bytes used as the CRC seed, e.g. `"0xA3, 0x7F"`. Each value must be 1–255.',
     };
     return optNames.map(opt => ({ label: opt, kind: CompletionItemKind.Property, detail: 'Option name', documentation: OPT_DOCS[opt] }));
   }
@@ -1370,6 +1448,43 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
       return [{ label: String(nextFree), kind: CompletionItemKind.Value, detail: 'Next available msgid' }];
     }
     return [{ label: '1', kind: CompletionItemKind.Value, detail: 'Enter a numeric ID' }];
+  }
+  if (/^\s*option\s+extensions_start\s*=\s*$/.test(lineUpToCursor)) {
+    const parsedDoc = getOrParseDocument(params.textDocument.uri);
+    const currentLine = params.position.line;
+    const containingMsg = parsedDoc.messages
+      .filter(m => m.line <= currentLine && currentLine <= (m.endLine ?? Infinity))
+      .sort((a, b) => b.line - a.line)[0];
+    if (containingMsg) {
+      const allTags = [
+        ...containingMsg.fields.map(f => f.tag),
+        ...containingMsg.oneofs.flatMap(o => o.fields.map(f => f.tag))
+      ];
+      // Check if we're inside a oneof
+      const containingOneof = containingMsg.oneofs.find(
+        o => o.line <= currentLine && currentLine <= (o.endLine ?? Infinity)
+      );
+      const scopeTags = containingOneof
+        ? containingOneof.fields.map(f => f.tag)
+        : allTags;
+      if (scopeTags.length > 0) {
+        const maxTag = Math.max(...scopeTags);
+        const suggested = maxTag + 1 > 2 ? maxTag : 2;
+        return [{ label: String(suggested), kind: CompletionItemKind.Value, detail: 'First extension field number' }];
+      }
+    }
+    return [{ label: '2', kind: CompletionItemKind.Value, detail: 'First extension field number (≥ 2)' }];
+  }
+  if (/^\s*option\s+magic_bytes\s*=\s*$/.test(lineUpToCursor)) {
+    return [
+      {
+        label: '"0xA3, 0x7F"',
+        kind: CompletionItemKind.Value,
+        detail: 'Two hex bytes (1–255 each)',
+        insertText: '"0x${1:A3}, 0x${2:7F}"',
+        insertTextFormat: InsertTextFormat.Snippet,
+      }
+    ];
   }
 
   // ── 5. Suppress completions while naming a oneof block ──────────────────
@@ -1910,7 +2025,9 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
         msgid: '**msgid** *(message option)*\n\nUnique message identifier for routing and deserialization (0–255 without pkgid, 0–65535 with pkgid). Required on most messages.',
         variable: '**variable** *(message option)*\n\nEnables variable-length encoding. Bounded fields (`max_size`) transmit only actual bytes instead of full allocated size.',
         is_envelope: '**is_envelope** *(message option)*\n\nMarks message as a container/wrapper. Must have exactly one `oneof` field whose variants are all message types.',
-        discriminator: '**discriminator** *(oneof option)*\n\nControls how the oneof variant is identified during deserialization:\n- `"auto"` — uses `msgid` if all variants have one, otherwise `field_order`\n- `"msgid"` — uint16 discriminator by message ID\n- `"field_order"` — uint8 1-based field index; generates a companion enum\n- `"none"` — no discriminator stored; caller handles disambiguation manually'
+        discriminator: '**discriminator** *(oneof option)*\n\nControls how the oneof variant is identified during deserialization:\n- `"auto"` — uses `msgid` if all variants have one, otherwise `field_order`\n- `"msgid"` — uint16 discriminator by message ID\n- `"field_order"` — uint8 1-based field index; generates a companion enum\n- `"none"` — no discriminator stored; caller handles disambiguation manually',
+        extensions_start: '**extensions_start** *(message/oneof option)*\n\nFirst extension field number (must be ≥ 2). Fields with this number or higher are **extension fields** — newer senders include them; older receivers zero-fill them on reception.\n\nMagic bytes and base-size computations use only the fields *before* this number. Adding extension fields never changes the magic bytes.',
+        magic_bytes: '**magic_bytes** *(message option)*\n\nOverrides the auto-calculated two-byte CRC seed, e.g. `"0xA3, 0x7F"`. Use when a schema change (e.g. renaming an enum) would alter the calculated magic bytes but the wire layout is genuinely unchanged.\n\n- Exactly two comma-separated values required\n- Each value must be 1–255 (hex or decimal)\n- Prefer the calculated bytes unless intentional wire-compatibility is needed',
       };
       if (OPT_DOCS[word]) {
         return { contents: { kind: MarkupKind.Markdown, value: OPT_DOCS[word] } };
