@@ -746,10 +746,10 @@ function validateDocument(uri: string): void {
           `option magic_bytes requires exactly two comma-separated values, e.g. "0xA3, 0x7F"`));
       } else {
         for (const part of mbParts) {
-          const val = part.startsWith('0x') || part.startsWith('0X')
-            ? parseInt(part, 16)
-            : parseInt(part, 10);
-          if (isNaN(val) || val < 1 || val > 255) {
+          const isHex = /^0[xX][0-9a-fA-F]+$/.test(part);
+          const isDec = /^\d+$/.test(part);
+          const val = isHex ? parseInt(part, 16) : isDec ? parseInt(part, 10) : NaN;
+          if (!isHex && !isDec || isNaN(val) || val < 1 || val > 255) {
             diagnostics.push(makeDiagnostic(optLine,
               `option magic_bytes: each value must be 1–255 (hex or decimal), got '${part}'`));
           }
@@ -760,19 +760,24 @@ function validateDocument(uri: string): void {
     // message-level extensions_start validation
     if (msg.options['extensions_start'] !== undefined) {
       const extStartStr = msg.options['extensions_start'];
-      const extStart = parseInt(extStartStr, 10);
       const optLine = msg.optionLines['extensions_start'] ?? msg.line;
-      if (isNaN(extStart) || extStart < 2) {
+      if (!/^\d+$/.test(extStartStr)) {
         diagnostics.push(makeDiagnostic(optLine,
           `option extensions_start must be an integer ≥ 2, got '${extStartStr}'`));
       } else {
-        const allFieldTags = new Set([
-          ...msg.fields.map(f => f.tag),
-          ...msg.oneofs.flatMap(o => o.fields.map(f => f.tag))
-        ]);
-        if (!allFieldTags.has(extStart)) {
+        const extStart = parseInt(extStartStr, 10);
+        if (extStart < 2) {
           diagnostics.push(makeDiagnostic(optLine,
-            `option extensions_start=${extStart} must equal an existing field number in '${msg.name}'`));
+            `option extensions_start must be an integer ≥ 2, got '${extStartStr}'`));
+        } else {
+          const allFieldTags = new Set([
+            ...msg.fields.map(f => f.tag),
+            ...msg.oneofs.flatMap(o => o.fields.map(f => f.tag))
+          ]);
+          if (!allFieldTags.has(extStart)) {
+            diagnostics.push(makeDiagnostic(optLine,
+              `option extensions_start=${extStart} must equal an existing field number in '${msg.name}'`));
+          }
         }
       }
     }
@@ -795,16 +800,21 @@ function validateDocument(uri: string): void {
     for (const oneof of msg.oneofs) {
       if (oneof.options['extensions_start'] !== undefined) {
         const extStartStr = oneof.options['extensions_start'];
-        const extStart = parseInt(extStartStr, 10);
         const optLine = oneof.optionLines['extensions_start'] ?? oneof.line;
-        if (isNaN(extStart) || extStart < 2) {
+        if (!/^\d+$/.test(extStartStr)) {
           diagnostics.push(makeDiagnostic(optLine,
             `option extensions_start must be an integer ≥ 2, got '${extStartStr}'`));
         } else {
-          const oneofTags = new Set(oneof.fields.map(f => f.tag));
-          if (!oneofTags.has(extStart)) {
+          const extStart = parseInt(extStartStr, 10);
+          if (extStart < 2) {
             diagnostics.push(makeDiagnostic(optLine,
-              `option extensions_start=${extStart} must equal an existing field number in oneof '${oneof.name}'`));
+              `option extensions_start must be an integer ≥ 2, got '${extStartStr}'`));
+          } else {
+            const oneofTags = new Set(oneof.fields.map(f => f.tag));
+            if (!oneofTags.has(extStart)) {
+              diagnostics.push(makeDiagnostic(optLine,
+                `option extensions_start=${extStart} must equal an existing field number in oneof '${oneof.name}'`));
+            }
           }
         }
       }
@@ -839,12 +849,10 @@ function validateDocument(uri: string): void {
     // Field number uniqueness and sequential validation (1..N, no gaps, no duplicates)
     {
       const allTags = new Map<number, string>();
-      let hasDuplicates = false;
       for (const field of msg.fields) {
         if (allTags.has(field.tag)) {
           diagnostics.push(makeDiagnostic(field.line,
             `Duplicate field number ${field.tag} in '${msg.name}' (already used by '${allTags.get(field.tag)}')`));
-          hasDuplicates = true;
         } else {
           allTags.set(field.tag, field.name);
         }
@@ -854,14 +862,13 @@ function validateDocument(uri: string): void {
           if (allTags.has(field.tag)) {
             diagnostics.push(makeDiagnostic(field.line,
               `Duplicate field number ${field.tag} in '${msg.name}' (already used by '${allTags.get(field.tag)}')`));
-            hasDuplicates = true;
           } else {
             allTags.set(field.tag, field.name);
           }
         }
       }
       // Check that field numbers form a contiguous sequence starting at 1 (no gaps)
-      if (!hasDuplicates && allTags.size > 0) {
+      if (allTags.size > 0) {
         const maxTag = Math.max(...allTags.keys());
         for (let n = 1; n <= maxTag; n++) {
           if (!allTags.has(n)) {
