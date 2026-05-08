@@ -33,3 +33,34 @@ message Container {
     SensorReading other = 3;
   }
 }
+
+// Wire-evolution example: v2 adds extension fields without breaking v1 receivers
+message DeviceStatus {
+  option msgid = 3;
+  option magic_bytes = "0xA3, 0x7F";  // Override CRC seed for schema compatibility
+
+  // Base fields (always on the wire)
+  uint8  device_id   = 1;
+  uint8  status_code = 2;
+  uint16 error_flags = 3;
+
+  // Extension fields: present in v2+ firmware; older receivers zero-fill on reception
+  option extensions_start = 4;
+  uint32 uptime_seconds = 4;
+  float  cpu_temp       = 5;
+}
+
+// Oneof-level extensions example
+message JobMessage {
+  option msgid = 4;
+
+  bool run_immediately = 1;
+
+  oneof job {
+    option discriminator = "field_order";
+    SensorReading sensor_job = 2;
+    // Extension variants: older receivers see an unknown discriminator and skip
+    option extensions_start = 3;
+    DeviceStatus device_job = 3;
+  }
+}
