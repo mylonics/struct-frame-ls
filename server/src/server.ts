@@ -2008,10 +2008,11 @@ function findGeneratedFileLocations(word: string): Location[] {
 }
 
 function buildCompileInfoMarkdown(entry: SfCompileEntry): string {
+  const toHex = (b: number) => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`;
   const lines: string[] = [];
   if (entry.magic_bytes) {
     const [b1, b2] = entry.magic_bytes;
-    lines.push(`**Checksum seed (magic bytes):** \`0x${b1.toString(16).toUpperCase().padStart(2, '0')}, 0x${b2.toString(16).toUpperCase().padStart(2, '0')}\``);
+    lines.push(`**Checksum seed (magic bytes):** \`${toHex(b1)}, ${toHex(b2)}\``);
   }
   if (entry.max_size !== undefined) {
     if (entry.is_variable) {
@@ -2260,15 +2261,16 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
       if (oneofInfo) {
         if (oneofInfo.variable) oneofInfoLines.push('variable: `true`');
         if (oneofInfo.size !== undefined) {
-          if (oneofInfo.variable && oneofInfo.min_size_override !== undefined && oneofInfo.min_size_override !== null) {
+          const hasMinOverride = oneofInfo.min_size_override != null;
+          if (oneofInfo.variable && hasMinOverride) {
             oneofInfoLines.push(`size: ${oneofInfo.min_size_override}–${oneofInfo.size} bytes`);
           } else {
             oneofInfoLines.push(`size: ${oneofInfo.size} bytes`);
           }
         }
-        if (oneofInfo.min_size_override !== undefined && oneofInfo.min_size_override !== null)
+        if (oneofInfo.min_size_override != null)
           oneofInfoLines.push(`min_size: ${oneofInfo.min_size_override}`);
-        if (oneofInfo.max_size_override !== undefined && oneofInfo.max_size_override !== null)
+        if (oneofInfo.max_size_override != null)
           oneofInfoLines.push(`max_size: ${oneofInfo.max_size_override}`);
       }
       const oneofInfoSection = oneofInfoLines.length ? `\n\n${oneofInfoLines.map(l => `- ${l}`).join('\n')}` : '';
