@@ -111,12 +111,34 @@ interface SfCompileGeneratedFiles {
   [key: string]: SfCompileGeneratedFileEntry | undefined;
 }
 
+interface SfCompileOneofEntry {
+  name: string;
+  size: number;
+  base_size?: number;
+  variable?: boolean;
+  auto_discriminator?: boolean;
+  discriminator_type?: string | null;
+  min_size_override?: number | null;
+  max_size_override?: number | null;
+  variants?: Array<{ disc_val: number; field_name: string; field_size: number }>;
+}
+
 interface SfCompileEntry {
   name: string;
   package: string;
   source_file: string;
   generated_files: SfCompileGeneratedFiles;
   parent_message?: string;
+  // New fields (struct-frame latest release)
+  msgid?: number | null;
+  max_size?: number;
+  base_size?: number;
+  min_size?: number;
+  is_variable?: boolean;
+  is_envelope?: boolean;
+  extensions_start?: number | null;
+  magic_bytes?: [number, number] | null;
+  oneofs?: SfCompileOneofEntry[] | null;
 }
 
 interface SfCompileConfig {
@@ -847,33 +869,46 @@ function validateDocument(uri: string): void {
     }
 
     // Field number uniqueness and sequential validation (1..N, no gaps, no duplicates)
+    // Oneof fields are numbered independently from message fields — each oneof
+    // maintains its own 1..N sequence separate from the parent message.
     {
-      const allTags = new Map<number, string>();
+      const msgTags = new Map<number, string>();
       for (const field of msg.fields) {
-        if (allTags.has(field.tag)) {
+        if (msgTags.has(field.tag)) {
           diagnostics.push(makeDiagnostic(field.line,
-            `Duplicate field number ${field.tag} in '${msg.name}' (already used by '${allTags.get(field.tag)}')`));
+            `Duplicate field number ${field.tag} in '${msg.name}' (already used by '${msgTags.get(field.tag)}')`));
         } else {
-          allTags.set(field.tag, field.name);
+          msgTags.set(field.tag, field.name);
         }
       }
-      for (const oneof of msg.oneofs) {
-        for (const field of oneof.fields) {
-          if (allTags.has(field.tag)) {
-            diagnostics.push(makeDiagnostic(field.line,
-              `Duplicate field number ${field.tag} in '${msg.name}' (already used by '${allTags.get(field.tag)}')`));
-          } else {
-            allTags.set(field.tag, field.name);
+      // Check that message-level field numbers form a contiguous sequence starting at 1
+      if (msgTags.size > 0) {
+        const maxTag = Math.max(...msgTags.keys());
+        for (let n = 1; n <= maxTag; n++) {
+          if (!msgTags.has(n)) {
+            diagnostics.push(makeDiagnostic(msg.line,
+              `Field numbers in '${msg.name}' must be sequential starting at 1; field number ${n} is missing`));
           }
         }
       }
-      // Check that field numbers form a contiguous sequence starting at 1 (no gaps)
-      if (allTags.size > 0) {
-        const maxTag = Math.max(...allTags.keys());
-        for (let n = 1; n <= maxTag; n++) {
-          if (!allTags.has(n)) {
-            diagnostics.push(makeDiagnostic(msg.line,
-              `Field numbers in '${msg.name}' must be sequential starting at 1; field number ${n} is missing`));
+      // Validate each oneof's field numbers independently (separate 1..N sequence)
+      for (const oneof of msg.oneofs) {
+        const oneofTags = new Map<number, string>();
+        for (const field of oneof.fields) {
+          if (oneofTags.has(field.tag)) {
+            diagnostics.push(makeDiagnostic(field.line,
+              `Duplicate field number ${field.tag} in oneof '${oneof.name}' (already used by '${oneofTags.get(field.tag)}')`));
+          } else {
+            oneofTags.set(field.tag, field.name);
+          }
+        }
+        if (oneofTags.size > 0) {
+          const maxOneofTag = Math.max(...oneofTags.keys());
+          for (let n = 1; n <= maxOneofTag; n++) {
+            if (!oneofTags.has(n)) {
+              diagnostics.push(makeDiagnostic(oneof.line,
+                `Field numbers in oneof '${oneof.name}' must be sequential starting at 1; field number ${n} is missing`));
+            }
           }
         }
       }
@@ -1972,6 +2007,26 @@ function findGeneratedFileLocations(word: string): Location[] {
   return locations;
 }
 
+function buildCompileInfoMarkdown(entry: SfCompileEntry): string {
+  const lines: string[] = [];
+  if (entry.magic_bytes) {
+    const [b1, b2] = entry.magic_bytes;
+    lines.push(`**Checksum seed (magic bytes):** \`0x${b1.toString(16).toUpperCase().padStart(2, '0')}, 0x${b2.toString(16).toUpperCase().padStart(2, '0')}\``);
+  }
+  if (entry.max_size !== undefined) {
+    if (entry.is_variable) {
+      const minStr = entry.min_size !== undefined ? `${entry.min_size}` : '?';
+      lines.push(`**Size:** ${minStr}–${entry.max_size} bytes (variable)`);
+    } else if (entry.base_size !== undefined && entry.base_size !== entry.max_size) {
+      lines.push(`**Size:** ${entry.base_size} bytes (base), ${entry.max_size} bytes (with extensions)`);
+    } else {
+      lines.push(`**Size:** ${entry.max_size} bytes`);
+    }
+  }
+  if (lines.length === 0) return '';
+  return `\n\n${lines.join('\n\n')}`;
+}
+
 function buildGeneratedFilesMarkdown(entry: SfCompileEntry): string {
   const files = entry.generated_files;
   const lines = Object.entries(files)
@@ -2125,13 +2180,14 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
     const msg = allDefs.messages.find(m => m.name === word);
     if (msg) {
       const compileEntry = findInCompileConfig(word);
+      const compileInfo = compileEntry ? buildCompileInfoMarkdown(compileEntry) : '';
       const generatedSection = compileEntry ? buildGeneratedFilesMarkdown(compileEntry) : '';
       if (isDeclaration) {
-        // On the declaration line — just show generated files, no redundant struct body
+        // On the declaration line — just show compile info and generated files, no redundant struct body
         return {
           contents: {
             kind: MarkupKind.Markdown,
-            value: `**message ${word}**${generatedSection}`
+            value: `**message ${word}**${compileInfo}${generatedSection}`
           }
         };
       }
@@ -2141,7 +2197,7 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
       return {
         contents: {
           kind: MarkupKind.Markdown,
-          value: `**message ${word}**\n\`\`\`sf\nmessage ${word} {\n${body}\n}\n\`\`\`${generatedSection}`
+          value: `**message ${word}**\n\`\`\`sf\nmessage ${word} {\n${body}\n}\n\`\`\`${compileInfo}${generatedSection}`
         }
       };
     }
@@ -2170,13 +2226,14 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
     // Not found via imports - check compile config for cross-file types
     const compileEntry = findInCompileConfig(word);
     if (compileEntry) {
+      const compileInfo = buildCompileInfoMarkdown(compileEntry);
       const generatedSection = buildGeneratedFilesMarkdown(compileEntry);
       const kind = isEnumInCompileConfig(word) ? 'enum' : 'message';
       const parentNote = compileEntry.parent_message ? ` (nested in \`${compileEntry.parent_message}\`)` : '';
       return {
         contents: {
           kind: MarkupKind.Markdown,
-          value: `**${kind} ${word}** (package: \`${compileEntry.package}\`)${parentNote}${generatedSection}`
+          value: `**${kind} ${word}** (package: \`${compileEntry.package}\`)${parentNote}${compileInfo}${generatedSection}`
         }
       };
     }
@@ -2196,11 +2253,31 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
       const compileEntry = sfCompileConfig?.enums.find(e => e.name === enumName) ?? null;
       const generatedSection = compileEntry ? buildGeneratedFilesMarkdown(compileEntry) : '';
 
+      // Look up oneof info from the parent message compile entry
+      const msgCompileEntry = sfCompileConfig?.messages.find(m => m.name === msg.name) ?? null;
+      const oneofInfo = msgCompileEntry?.oneofs?.find(o => o.name === word) ?? null;
+      const oneofInfoLines: string[] = [];
+      if (oneofInfo) {
+        if (oneofInfo.variable) oneofInfoLines.push('variable: `true`');
+        if (oneofInfo.size !== undefined) {
+          if (oneofInfo.variable && oneofInfo.min_size_override !== undefined && oneofInfo.min_size_override !== null) {
+            oneofInfoLines.push(`size: ${oneofInfo.min_size_override}–${oneofInfo.size} bytes`);
+          } else {
+            oneofInfoLines.push(`size: ${oneofInfo.size} bytes`);
+          }
+        }
+        if (oneofInfo.min_size_override !== undefined && oneofInfo.min_size_override !== null)
+          oneofInfoLines.push(`min_size: ${oneofInfo.min_size_override}`);
+        if (oneofInfo.max_size_override !== undefined && oneofInfo.max_size_override !== null)
+          oneofInfoLines.push(`max_size: ${oneofInfo.max_size_override}`);
+      }
+      const oneofInfoSection = oneofInfoLines.length ? `\n\n${oneofInfoLines.map(l => `- ${l}`).join('\n')}` : '';
+
       if (rawDisc === 'none') {
         return {
           contents: {
             kind: MarkupKind.Markdown,
-            value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`none\` — no companion enum generated`
+            value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`none\` — no companion enum generated${oneofInfoSection}`
           }
         };
       }
@@ -2215,7 +2292,7 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
         return {
           contents: {
             kind: MarkupKind.Markdown,
-            value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`msgid\` (uint16)\n\n\`\`\`sf\noneof ${word} {\n${variantLines}\n}\n\`\`\`${generatedSection}`
+            value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`msgid\` (uint16)\n\n\`\`\`sf\noneof ${word} {\n${variantLines}\n}\n\`\`\`${oneofInfoSection}${generatedSection}`
           }
         };
       }
@@ -2239,7 +2316,7 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
           return {
             contents: {
               kind: MarkupKind.Markdown,
-              value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`auto\` → \`msgid\` (uint16)\n\n\`\`\`sf\noneof ${word} {\n${variantLines}\n}\n\`\`\`${generatedSection}`
+              value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`auto\` → \`msgid\` (uint16)\n\n\`\`\`sf\noneof ${word} {\n${variantLines}\n}\n\`\`\`${oneofInfoSection}${generatedSection}`
             }
           };
         }
@@ -2252,7 +2329,7 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
       return {
         contents: {
           kind: MarkupKind.Markdown,
-          value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`${rawDisc}\`${rawDisc === 'auto' ? ' → `field_order`' : ''} (uint8)\n\n**Generated companion enum:**\n\`\`\`sf\nenum ${enumName} {\n${valueLines}\n}\n\`\`\`${generatedSection}`
+          value: `**oneof ${word}** (in \`${msg.name}\`)\n\ndiscriminator: \`${rawDisc}\`${rawDisc === 'auto' ? ' → `field_order`' : ''} (uint8)\n\n**Generated companion enum:**\n\`\`\`sf\nenum ${enumName} {\n${valueLines}\n}\n\`\`\`${oneofInfoSection}${generatedSection}`
         }
       };
     }
