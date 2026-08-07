@@ -85,6 +85,7 @@
     "watch": "node esbuild.js --watch",
     "bundle": "node esbuild.js",
     "typecheck": "tsc -b --noEmit",
+    "test": "tsc -b && node --test server/out/**/*.test.js",
     "package": "vsce package"
   },
   "devDependencies": {

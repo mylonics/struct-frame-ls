@@ -29,6 +29,9 @@ jobs:
       - name: Compile Extension
         run: npm run compile
 
+      - name: Test
+        run: npm test
+
       - name: Package VSIX
         run: npx vsce package -o struct-frame-ls.vsix
 

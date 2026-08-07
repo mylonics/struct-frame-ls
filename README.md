@@ -9,8 +9,8 @@ VSCode Language Server for struct-frame (.sf files)
 - **Autocomplete** — Context-aware suggestions:
   - Top-level keywords (`message`, `enum`, `package`, `import`, `option`, `repeated`, `oneof`)
   - Field types: all primitive types plus user-defined messages and enums from the current file and its imports
-  - Inside `[...]`: field option names (`size=`, `max_size=`, `element_size=`, `flatten=`)
-  - After `option`: option names (`msgid`, `pkgid`, `variable`)
+  - Inside `[...]`: field option names (`size=`, `max_size=`, `element_size=`, `flatten=`, `default=`)
+  - After `option`: context-aware option names (`msgid`, `pkgid`, `variable`, `magic_bytes`, `extensions_start`, and oneof options)
 - **Hover Documentation** — Hover over a type name to see its definition summary or a description of the primitive type
 - **Document Symbols / Outline** — All messages and enums listed in the outline with their fields and enum values
 
@@ -50,9 +50,36 @@ message Container {
 
 **Primitive types**: `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float`, `double`, `bool`, `string`
 
-**Field options** (in `[...]`): `size`, `max_size`, `element_size`, `flatten`
+**Field options** (in `[...]`): `size`, `max_size`, `element_size`, `flatten`, `default`
 
-**Message options**: `msgid`, `pkgid`, `variable`
+**Message options**: `msgid`, `variable`, `is_envelope`, `magic_bytes`, `extensions_start`
+
+**Oneof options**: `discriminator`, `variable`, `max_size`, `min_size`, `extensions_start`
+
+### Default values
+
+`default` is an initialization and decode-fallback value. It does not change wire layout,
+field size, or magic bytes. It is supported for integer types, `bool`, `float`, `double`,
+enum members, and fixed or bounded strings:
+
+```sf
+enum State { IDLE = 0; READY = 1; }
+
+message Defaults {
+  State state = 1 [default=READY];
+  bool enabled = 2 [default=true];
+  string label = 3 [size=16, default="ready"];
+}
+```
+
+Defaults are not supported on repeated fields, message-typed fields, or fields inside a
+`oneof`.
+
+### Diagnostics
+
+The language server validates duplicate and unknown field options, default values and their
+type ranges, magic-byte format, extension anchors, oneof size rules, and oneof variant fields.
+Unknown option names are warnings so newer generator options remain forward-compatible.
 
 ## Development
 

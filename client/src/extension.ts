@@ -35,6 +35,61 @@ interface SfCompileConfig {
   enums: SfCompileEntry[];
 }
 
+type RawGeneratedFile = string | Partial<SfCompileGeneratedFileEntry> | null | undefined;
+
+function normalizeGeneratedFileEntry(raw: RawGeneratedFile, fallbackElement: string): SfCompileGeneratedFileEntry | undefined {
+  if (typeof raw === 'string') {
+    return {
+      path: raw,
+      namespace: null,
+      element: fallbackElement,
+      qualified_element: fallbackElement
+    };
+  }
+  if (!raw || typeof raw.path !== 'string') return undefined;
+  return {
+    path: raw.path,
+    namespace: typeof raw.namespace === 'string' ? raw.namespace : null,
+    element: typeof raw.element === 'string' ? raw.element : fallbackElement,
+    qualified_element: typeof raw.qualified_element === 'string' ? raw.qualified_element : fallbackElement
+  };
+}
+
+function normalizeSfCompileEntry(raw: unknown): SfCompileEntry | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const entry = raw as Partial<SfCompileEntry>;
+  if (typeof entry.name !== 'string') return undefined;
+  const generatedFiles: Record<string, SfCompileGeneratedFileEntry> = {};
+  if (entry.generated_files && typeof entry.generated_files === 'object') {
+    for (const [language, generatedFile] of Object.entries(entry.generated_files as Record<string, RawGeneratedFile>)) {
+      const normalized = normalizeGeneratedFileEntry(generatedFile, entry.name);
+      if (normalized) generatedFiles[language] = normalized;
+    }
+  }
+  return {
+    name: entry.name,
+    package: typeof entry.package === 'string' ? entry.package : '',
+    source_file: typeof entry.source_file === 'string' ? entry.source_file : '',
+    generated_files: generatedFiles
+  };
+}
+
+function normalizeSfCompileConfig(raw: unknown): SfCompileConfig {
+  if (!raw || typeof raw !== 'object') {
+    return { messages: [], nested_messages: [], enums: [] };
+  }
+  const config = raw as { messages?: unknown; nested_messages?: unknown; enums?: unknown };
+  const normalizeEntries = (entries: unknown): SfCompileEntry[] =>
+    Array.isArray(entries)
+      ? entries.map(normalizeSfCompileEntry).filter((entry): entry is SfCompileEntry => entry !== undefined)
+      : [];
+  return {
+    messages: normalizeEntries(config.messages),
+    nested_messages: normalizeEntries(config.nested_messages),
+    enums: normalizeEntries(config.enums)
+  };
+}
+
 function getCompileConfigFsPath(): string | null {
   const config = workspace.getConfiguration('structFrameLs');
   const configPath = config.get<string>('compileConfigPath') || 'sf_compile.json';
@@ -48,7 +103,7 @@ function getCompileConfigFsPath(): string | null {
 
 function readCompileConfig(fsPath: string): SfCompileConfig | null {
   try {
-    return JSON.parse(fs.readFileSync(fsPath, 'utf-8')) as SfCompileConfig;
+    return normalizeSfCompileConfig(JSON.parse(fs.readFileSync(fsPath, 'utf-8')));
   } catch {
     return null;
   }

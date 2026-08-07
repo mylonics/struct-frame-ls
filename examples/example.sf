@@ -4,8 +4,6 @@ package sensor_data;
 
 option pkgid = 1;
 
-import "other_file.sf";
-
 /* Enum for sensor status */
 enum SensorStatus {
   OFFLINE = 0;
@@ -16,19 +14,22 @@ enum SensorStatus {
 message SensorReading {
   option msgid = 1;
   option variable = true;
+  option magic_bytes = "0xA3, 0x7F";
 
-  SensorStatus status = 1;
-  float value = 2;
-  string name = 3 [size=16];
+  SensorStatus status = 1 [default = ONLINE];
+  float value = 2 [default = 0.0];
+  string name = 3 [size=16, default = "unknown"];
   repeated uint8 data = 4 [max_size=200];
   uint32 timestamp = 5;
 }
 
 message Container {
   option msgid = 2;
-  SensorReading reading = 1 [flatten=true];
+  option variable = true;
+  SensorReading reading = 1;
 
   oneof payload {
+    option variable = true;
     SensorReading sensor = 2;
     SensorReading other = 3;
   }
