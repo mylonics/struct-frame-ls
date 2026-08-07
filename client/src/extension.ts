@@ -27,12 +27,97 @@ interface SfCompileEntry {
   package: string;
   source_file: string;
   generated_files: Record<string, SfCompileGeneratedFileEntry>;
+  parent_message?: string;
+  msgid?: number | null;
+  max_size?: number;
+  base_size?: number;
+  min_size?: number;
+  is_variable?: boolean;
+  is_envelope?: boolean;
+  extensions_start?: number | null;
+  magic_bytes?: [number, number] | null;
+  oneofs?: Array<{
+    name: string;
+    size: number;
+    base_size?: number;
+    variable?: boolean;
+    auto_discriminator?: boolean;
+    discriminator_type?: string | null;
+    min_size_override?: number | null;
+    max_size_override?: number | null;
+    variants?: Array<{ disc_val: number; field_name: string; field_size: number }>;
+  }> | null;
 }
 
 interface SfCompileConfig {
   messages: SfCompileEntry[];
   nested_messages?: SfCompileEntry[];
   enums: SfCompileEntry[];
+}
+
+type RawGeneratedFile = string | Partial<SfCompileGeneratedFileEntry> | null | undefined;
+
+function normalizeGeneratedFileEntry(raw: RawGeneratedFile, fallbackElement: string): SfCompileGeneratedFileEntry | undefined {
+  if (typeof raw === 'string') {
+    return {
+      path: raw,
+      namespace: null,
+      element: fallbackElement,
+      qualified_element: fallbackElement
+    };
+  }
+  if (!raw || typeof raw.path !== 'string') return undefined;
+  return {
+    path: raw.path,
+    namespace: typeof raw.namespace === 'string' ? raw.namespace : null,
+    element: typeof raw.element === 'string' ? raw.element : fallbackElement,
+    qualified_element: typeof raw.qualified_element === 'string' ? raw.qualified_element : fallbackElement
+  };
+}
+
+function normalizeSfCompileEntry(raw: unknown): SfCompileEntry | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const entry = raw as Partial<SfCompileEntry> & { generated_files?: unknown };
+  if (typeof entry.name !== 'string') return undefined;
+  const generatedFiles: Record<string, SfCompileGeneratedFileEntry> = {};
+  if (entry.generated_files && typeof entry.generated_files === 'object') {
+    for (const [language, generatedFile] of Object.entries(entry.generated_files as Record<string, RawGeneratedFile>)) {
+      const normalized = normalizeGeneratedFileEntry(generatedFile, entry.name);
+      if (normalized) generatedFiles[language] = normalized;
+    }
+  }
+  return {
+    name: entry.name,
+    package: typeof entry.package === 'string' ? entry.package : '',
+    source_file: typeof entry.source_file === 'string' ? entry.source_file : '',
+    generated_files: generatedFiles,
+    ...(typeof entry.parent_message === 'string' ? { parent_message: entry.parent_message } : {}),
+    ...(typeof entry.msgid === 'number' || entry.msgid === null ? { msgid: entry.msgid } : {}),
+    ...(typeof entry.max_size === 'number' ? { max_size: entry.max_size } : {}),
+    ...(typeof entry.base_size === 'number' ? { base_size: entry.base_size } : {}),
+    ...(typeof entry.min_size === 'number' ? { min_size: entry.min_size } : {}),
+    ...(typeof entry.is_variable === 'boolean' ? { is_variable: entry.is_variable } : {}),
+    ...(typeof entry.is_envelope === 'boolean' ? { is_envelope: entry.is_envelope } : {}),
+    ...(typeof entry.extensions_start === 'number' || entry.extensions_start === null ? { extensions_start: entry.extensions_start } : {}),
+    ...(Array.isArray(entry.magic_bytes) ? { magic_bytes: entry.magic_bytes as [number, number] } : {}),
+    ...(Array.isArray(entry.oneofs) ? { oneofs: entry.oneofs } : {})
+  };
+}
+
+function normalizeSfCompileConfig(raw: unknown): SfCompileConfig {
+  if (!raw || typeof raw !== 'object') {
+    return { messages: [], nested_messages: [], enums: [] };
+  }
+  const config = raw as { messages?: unknown; nested_messages?: unknown; enums?: unknown };
+  const normalizeEntries = (entries: unknown): SfCompileEntry[] =>
+    Array.isArray(entries)
+      ? entries.map(normalizeSfCompileEntry).filter((entry): entry is SfCompileEntry => entry !== undefined)
+      : [];
+  return {
+    messages: normalizeEntries(config.messages),
+    nested_messages: normalizeEntries(config.nested_messages),
+    enums: normalizeEntries(config.enums)
+  };
 }
 
 function getCompileConfigFsPath(): string | null {
@@ -48,7 +133,7 @@ function getCompileConfigFsPath(): string | null {
 
 function readCompileConfig(fsPath: string): SfCompileConfig | null {
   try {
-    return JSON.parse(fs.readFileSync(fsPath, 'utf-8')) as SfCompileConfig;
+    return normalizeSfCompileConfig(JSON.parse(fs.readFileSync(fsPath, 'utf-8')));
   } catch {
     return null;
   }

@@ -4,8 +4,6 @@ package sensor_data;
 
 option pkgid = 1;
 
-import "other_file.sf";
-
 /* Enum for sensor status */
 enum SensorStatus {
   OFFLINE = 0;
@@ -17,20 +15,22 @@ message SensorReading {
   option msgid = 1;
   option variable = true;
 
-  SensorStatus status = 1;
-  float value = 2;
-  string name = 3 [size=16];
+  SensorStatus status = 1 [default = ONLINE];
+  float value = 2 [default = 0.0];
+  string name = 3 [size=16, default = "unknown"];
   repeated uint8 data = 4 [max_size=200];
   uint32 timestamp = 5;
 }
 
 message Container {
   option msgid = 2;
-  SensorReading reading = 1 [flatten=true];
+  option variable = true;
+  SensorReading reading = 1;
 
   oneof payload {
-    SensorReading sensor = 2;
-    SensorReading other = 3;
+    option variable = true;
+    SensorReading sensor = 1;
+    SensorReading other = 2;
   }
 }
 
@@ -58,9 +58,9 @@ message JobMessage {
 
   oneof job {
     option discriminator = "field_order";
-    SensorReading sensor_job = 2;
+    SensorReading sensor_job = 1;
     // Extension variants: older receivers see an unknown discriminator and skip
-    option extensions_start = 3;
-    DeviceStatus device_job = 3;
+    option extensions_start = 2;
+    DeviceStatus device_job = 2;
   }
 }
