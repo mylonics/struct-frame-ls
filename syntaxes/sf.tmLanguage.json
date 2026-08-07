@@ -101,6 +101,7 @@
       "name": "meta.field.options.sf",
       "begin": "\\[",
       "end": "\\]",
+      "applyEndPatternLast": true,
       "beginCaptures": {
         "0": { "name": "punctuation.definition.field-options.begin.sf" }
       },
@@ -108,13 +109,18 @@
         "0": { "name": "punctuation.definition.field-options.end.sf" }
       },
       "patterns": [
+        { "include": "#string" },
         {
           "name": "support.type.property-name.sf",
-          "match": "\\b(size|max_size|element_size|flatten)\\b"
+          "match": "\\b(size|max_size|element_size|flatten|default)\\b"
+        },
+        {
+          "name": "variable.other.enummember.sf",
+          "match": "(?<==\\s*)[A-Za-z_][A-Za-z0-9_]*"
         },
         {
           "name": "constant.numeric.sf",
-          "match": "\\b[0-9]+(\\.[0-9]+)?\\b"
+          "match": "(?:-?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|0[xX][0-9a-fA-F]+)\\b"
         },
         {
           "name": "constant.language.sf",
@@ -123,7 +129,7 @@
       ]
     },
     "enum-value": {
-      "match": "^\\s*([A-Z][A-Z0-9_]*)\\s*(=)\\s*([0-9]+)\\s*;",
+      "match": "^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(=)\\s*([0-9]+)\\s*;",
       "captures": {
         "1": { "name": "variable.other.constant.sf" },
         "2": { "name": "keyword.operator.assignment.sf" },

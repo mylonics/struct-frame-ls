@@ -9,8 +9,8 @@ VSCode Language Server for struct-frame (.sf files)
 - **Autocomplete** — Context-aware suggestions:
   - Top-level keywords (`message`, `enum`, `package`, `import`, `option`, `repeated`, `oneof`)
   - Field types: all primitive types plus user-defined messages and enums from the current file and its imports
-  - Inside `[...]`: field option names (`size=`, `max_size=`, `element_size=`, `flatten=`)
-  - After `option`: option names (`msgid`, `pkgid`, `variable`)
+  - Inside `[...]`: field option names (`size=`, `max_size=`, `element_size=`, `flatten=`, `default=`)
+  - After `option`: context-aware option names (`msgid`, `pkgid`, `variable`, `magic_bytes`, `extensions_start`, and oneof options)
 - **Hover Documentation** — Hover over a type name to see its definition summary or a description of the primitive type
 - **Document Symbols / Outline** — All messages and enums listed in the outline with their fields and enum values
 
@@ -23,8 +23,6 @@ package sensor_data;
 
 option pkgid = 1;
 
-import "other_file.sf";
-
 enum SensorStatus {
   OFFLINE = 0;
   ONLINE  = 1;
@@ -34,25 +32,60 @@ enum SensorStatus {
 message SensorReading {
   option msgid = 1;
   option variable = true;
+  option magic_bytes = "0xA3, 0x7F";
 
-  SensorStatus status    = 1;
-  float        value     = 2;
-  string       name      = 3 [size=16];
+  SensorStatus status    = 1 [default=ONLINE];
+  float        value     = 2 [default=0.0];
+  string       name      = 3 [size=16, default="unknown"];
   repeated uint8 data    = 4 [max_size=200];
   uint32       timestamp = 5;
 }
 
 message Container {
   option msgid = 2;
-  SensorReading reading = 1 [flatten=true];
+  option variable = true;
+  SensorReading reading = 1;
+
+  oneof payload {
+    option variable = true;
+    SensorReading sensor = 1;
+    SensorReading other = 2;
+  }
 }
 ```
 
 **Primitive types**: `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float`, `double`, `bool`, `string`
 
-**Field options** (in `[...]`): `size`, `max_size`, `element_size`, `flatten`
+**Field options** (in `[...]`): `size`, `max_size`, `element_size`, `flatten`, `default`
 
-**Message options**: `msgid`, `pkgid`, `variable`
+**Message options**: `msgid`, `variable`, `is_envelope`, `magic_bytes`, `extensions_start`
+
+**Oneof options**: `discriminator`, `variable`, `max_size`, `min_size`, `extensions_start`
+
+### Default values
+
+`default` is an initialization and decode-fallback value. It does not change wire layout,
+field size, or magic bytes. It is supported for integer types, `bool`, `float`, `double`,
+enum members, and fixed or bounded strings:
+
+```sf
+enum State { IDLE = 0; READY = 1; }
+
+message Defaults {
+  State state = 1 [default=READY];
+  bool enabled = 2 [default=true];
+  string label = 3 [size=16, default="ready"];
+}
+```
+
+Defaults are not supported on repeated fields, message-typed fields, or fields inside a
+`oneof`.
+
+### Diagnostics
+
+The language server validates duplicate and unknown field options, default values and their
+type ranges, magic-byte format, extension anchors, field-number gaps/duplicates, oneof size
+rules, and oneof variant fields. Unknown option names are warnings for forward compatibility.
 
 ## Development
 

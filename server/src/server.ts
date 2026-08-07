@@ -35,6 +35,7 @@ import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import * as parser from './parser';
 
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
@@ -45,6 +46,12 @@ interface FieldDefinition {
   tag: number;
   repeated: boolean;
   options: Record<string, string>;
+  optionTokens?: parser.FieldOptionToken[];
+  optionsRaw?: string;
+  inOneof?: boolean;
+  oneofName?: string;
+  bracketStart?: number;
+  bracketEnd?: number;
   line: number;
 }
 
@@ -79,6 +86,8 @@ interface EnumDefinition {
   line: number;
   endLine: number;
   values: EnumValue[];
+  options?: Record<string, string>;
+  optionLines?: Record<string, number>;
   parentMessage?: string;
 }
 
@@ -151,6 +160,73 @@ let sfCompileConfig: SfCompileConfig | null = null;
 let sfCompileConfigPath = 'sf_compile.json';
 let workspaceRoot = '';
 
+type RawGeneratedFile = string | Partial<SfCompileGeneratedFileEntry> | null | undefined;
+
+function normalizeGeneratedFileEntry(raw: RawGeneratedFile, fallbackElement: string): SfCompileGeneratedFileEntry | undefined {
+  if (typeof raw === 'string') {
+    return {
+      path: raw,
+      namespace: null,
+      element: fallbackElement,
+      qualified_element: fallbackElement
+    };
+  }
+  if (!raw || typeof raw.path !== 'string') return undefined;
+  return {
+    path: raw.path,
+    namespace: typeof raw.namespace === 'string' ? raw.namespace : null,
+    element: typeof raw.element === 'string' ? raw.element : fallbackElement,
+    qualified_element: typeof raw.qualified_element === 'string' ? raw.qualified_element : fallbackElement
+  };
+}
+
+function normalizeSfCompileEntry(raw: unknown): SfCompileEntry | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const entry = raw as Partial<SfCompileEntry> & { generated_files?: unknown };
+  if (typeof entry.name !== 'string') return undefined;
+
+  const generatedFiles: SfCompileGeneratedFiles = {};
+  if (entry.generated_files && typeof entry.generated_files === 'object') {
+    for (const [language, generatedFile] of Object.entries(entry.generated_files as Record<string, RawGeneratedFile>)) {
+      const normalized = normalizeGeneratedFileEntry(generatedFile, entry.name);
+      if (normalized) generatedFiles[language] = normalized;
+    }
+  }
+
+  return {
+    name: entry.name,
+    package: typeof entry.package === 'string' ? entry.package : '',
+    source_file: typeof entry.source_file === 'string' ? entry.source_file : '',
+    generated_files: generatedFiles,
+    ...(typeof entry.parent_message === 'string' ? { parent_message: entry.parent_message } : {}),
+    ...(typeof entry.msgid === 'number' || entry.msgid === null ? { msgid: entry.msgid } : {}),
+    ...(typeof entry.max_size === 'number' ? { max_size: entry.max_size } : {}),
+    ...(typeof entry.base_size === 'number' ? { base_size: entry.base_size } : {}),
+    ...(typeof entry.min_size === 'number' ? { min_size: entry.min_size } : {}),
+    ...(typeof entry.is_variable === 'boolean' ? { is_variable: entry.is_variable } : {}),
+    ...(typeof entry.is_envelope === 'boolean' ? { is_envelope: entry.is_envelope } : {}),
+    ...(typeof entry.extensions_start === 'number' || entry.extensions_start === null ? { extensions_start: entry.extensions_start } : {}),
+    ...(Array.isArray(entry.magic_bytes) ? { magic_bytes: entry.magic_bytes as [number, number] } : {}),
+    ...(Array.isArray(entry.oneofs) ? { oneofs: entry.oneofs } : {})
+  };
+}
+
+function normalizeSfCompileConfig(raw: unknown): SfCompileConfig {
+  if (!raw || typeof raw !== 'object') {
+    return { messages: [], nested_messages: [], enums: [] };
+  }
+  const config = raw as { messages?: unknown; nested_messages?: unknown; enums?: unknown };
+  const normalizeEntries = (entries: unknown): SfCompileEntry[] =>
+    Array.isArray(entries)
+      ? entries.map(normalizeSfCompileEntry).filter((entry): entry is SfCompileEntry => entry !== undefined)
+      : [];
+  return {
+    messages: normalizeEntries(config.messages),
+    nested_messages: normalizeEntries(config.nested_messages),
+    enums: normalizeEntries(config.enums)
+  };
+}
+
 function loadSfCompileConfig(): void {
   if (!workspaceRoot) {
     connection.console.warn('loadSfCompileConfig: workspaceRoot is not set, skipping.');
@@ -163,7 +239,7 @@ function loadSfCompileConfig(): void {
   connection.console.log(`loadSfCompileConfig: reading '${configPath}'`);
   try {
     const content = fs.readFileSync(configPath, 'utf-8');
-    sfCompileConfig = JSON.parse(content) as SfCompileConfig;
+    sfCompileConfig = normalizeSfCompileConfig(JSON.parse(content));
     const msgCount = sfCompileConfig.messages.length + (sfCompileConfig.nested_messages?.length ?? 0);
     const enumCount = sfCompileConfig.enums.length;
     connection.console.log(`loadSfCompileConfig: loaded ${msgCount} message(s) and ${enumCount} enum(s) from '${configPath}'`);
@@ -232,10 +308,10 @@ const PRIMITIVE_TYPE_DOCS: Record<string, string> = {
 
 const KEYWORDS = ['package', 'import', 'option', 'message', 'enum', 'repeated', 'oneof'];
 const FILE_OPTION_NAMES = ['pkgid'];
-const MESSAGE_OPTION_NAMES = ['msgid', 'variable', 'is_envelope', 'extensions_start', 'magic_bytes'];
-const ONEOF_OPTION_NAMES = ['discriminator', 'extensions_start'];
+const MESSAGE_OPTION_NAMES = ['msgid', 'variable', 'is_envelope', 'magic_bytes', 'extensions_start'];
+const ONEOF_OPTION_NAMES = ['discriminator', 'variable', 'max_size', 'min_size', 'extensions_start'];
 const DISCRIMINATOR_VALUES = ['auto', 'msgid', 'field_order', 'none'];
-const FIELD_OPTION_NAMES = ['size=', 'max_size=', 'element_size=', 'flatten='];
+const FIELD_OPTION_NAMES = ['size=', 'max_size=', 'element_size=', 'flatten=', 'default='];
 
 function normalizeFieldOptionKey(key: string): string {
   if (key.startsWith('struct_frame.')) return key.substring('struct_frame.'.length);
@@ -244,15 +320,10 @@ function normalizeFieldOptionKey(key: string): string {
 }
 
 function parseFieldOptions(optionsStr: string): Record<string, string> {
-  const options: Record<string, string> = {};
-  for (const opt of optionsStr.split(',')) {
-    const kv = opt.trim().match(/^((?:(?:sf|struct_frame)\.)?(\w+))\s*=\s*(.+)$/);
-    if (kv) options[normalizeFieldOptionKey(kv[1])] = kv[3].trim();
-  }
-  return options;
+  return parser.parseFieldOptions(optionsStr);
 }
 
-function parseDocument(uri: string, content: string): ParsedDocument {
+function parseDocumentLegacy(uri: string, content: string): ParsedDocument {
   const lines = content.split('\n');
   const doc: ParsedDocument = {
     uri,
@@ -275,8 +346,7 @@ function parseDocument(uri: string, content: string): ParsedDocument {
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
     // Strip line comments
-    const commentIdx = rawLine.indexOf('//');
-    const line = commentIdx >= 0 ? rawLine.substring(0, commentIdx) : rawLine;
+    const line = parser.stripLineComment(rawLine);
     const trimmed = line.trim();
 
     if (!trimmed) continue;
@@ -562,6 +632,210 @@ function makeDiagnostic(line: number, message: string, severity: DiagnosticSever
   };
 }
 
+function makeRangeDiagnostic(range: Range, message: string, severity: DiagnosticSeverity = DiagnosticSeverity.Error, data?: unknown): Diagnostic {
+  return {
+    severity,
+    range,
+    message,
+    source: 'struct-frame',
+    data
+  };
+}
+
+const VALID_FIELD_OPTIONS = new Set(FIELD_OPTION_NAMES.map(option => option.slice(0, -1)));
+const INT_RANGES: Record<string, { min: bigint; max: bigint }> = {
+  int8: { min: -128n, max: 127n },
+  int16: { min: -32768n, max: 32767n },
+  int32: { min: -2147483648n, max: 2147483647n },
+  int64: { min: -9223372036854775808n, max: 9223372036854775807n },
+  uint8: { min: 0n, max: 255n },
+  uint16: { min: 0n, max: 65535n },
+  uint32: { min: 0n, max: 4294967295n },
+  uint64: { min: 0n, max: 18446744073709551615n }
+};
+
+function parseIntegerLiteral(value: string): bigint | null {
+  const trimmed = value.trim();
+  if (!/^[+-]?(?:0[xX][0-9a-fA-F]+|[0-9]+)$/.test(trimmed)) return null;
+  const negative = trimmed.startsWith('-');
+  const unsigned = trimmed.replace(/^[+-]/, '');
+  try {
+    const parsed = BigInt(unsigned);
+    return negative ? -parsed : parsed;
+  } catch {
+    return null;
+  }
+}
+
+function levenshteinDistance(left: string, right: string): number {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let leftIndex = 0; leftIndex < left.length; leftIndex++) {
+    const current = [leftIndex + 1];
+    for (let rightIndex = 0; rightIndex < right.length; rightIndex++) {
+      current.push(Math.min(
+        current[rightIndex] + 1,
+        previous[rightIndex + 1] + 1,
+        previous[rightIndex] + (left[leftIndex] === right[rightIndex] ? 0 : 1)
+      ));
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+  return previous[right.length];
+}
+
+function unescapeDefaultString(value: string): string {
+  return value.substring(1, value.length - 1).replace(/\\([ntr0"\\])/g, (_match, escaped: string) => ({
+    n: '\n',
+    t: '\t',
+    r: '\r',
+    '0': '\0',
+    '"': '"',
+    '\\': '\\'
+  }[escaped] ?? escaped));
+}
+
+function validateField(
+  field: FieldDefinition,
+  ctx: {
+    msg: MessageDefinition;
+    oneof: OneofDefinition | null;
+    messageNames: Set<string>;
+    allDefs: { messages: MessageDefinition[]; enums: EnumDefinition[] };
+    siblingFieldNames: FieldDefinition[];
+  },
+  diagnostics: Diagnostic[]
+): void {
+  const tokens = field.optionTokens ?? parser.tokenizeFieldOptions(field.optionsRaw ?? '', 0);
+  const seenOptions = new Set<string>();
+  for (const token of tokens) {
+    const displayKey = token.rawKey || token.key || field.optionsRaw || '';
+    const optionRange = Range.create(field.line, token.keyStart, field.line, token.keyEnd);
+    if (token.malformed) {
+      diagnostics.push(makeRangeDiagnostic(optionRange, `Malformed field option '${displayKey}'; expected name = value`, DiagnosticSeverity.Warning));
+      continue;
+    }
+    if (!VALID_FIELD_OPTIONS.has(token.key)) {
+      const suggestion = [...VALID_FIELD_OPTIONS].find(option => levenshteinDistance(token.key, option) <= 2);
+      diagnostics.push(makeRangeDiagnostic(
+        optionRange,
+        `Unknown field option '${token.key}'. Valid options: ${[...VALID_FIELD_OPTIONS].join(', ')}` + (suggestion ? ` Did you mean '${suggestion}'?` : ''),
+        DiagnosticSeverity.Warning
+      ));
+    }
+    if (seenOptions.has(token.key)) {
+      diagnostics.push(makeRangeDiagnostic(optionRange, `Duplicate field option '${token.key}'`, DiagnosticSeverity.Warning));
+    }
+    seenOptions.add(token.key);
+  }
+
+  const defaultToken = tokens.find(token => token.key === 'default' && !token.malformed);
+  if (defaultToken) {
+    const defaultData = {
+      fix: 'remove_default',
+      tokenStart: defaultToken.tokenStart,
+      tokenEnd: defaultToken.tokenEnd,
+      bracketStart: field.bracketStart ?? defaultToken.tokenStart,
+      bracketEnd: field.bracketEnd ?? defaultToken.tokenEnd,
+      onlyOption: tokens.length === 1
+    };
+    const defaultDiagnostic = (range: Range, message: string): void => {
+      diagnostics.push(makeRangeDiagnostic(range, message, DiagnosticSeverity.Error, defaultData));
+    };
+    if (field.repeated) {
+      defaultDiagnostic(Range.create(field.line, defaultToken.tokenStart, field.line, defaultToken.tokenEnd), `default is not supported on repeated field '${field.name}'`);
+    } else if (ctx.oneof) {
+      defaultDiagnostic(Range.create(field.line, defaultToken.tokenStart, field.line, defaultToken.tokenEnd), `default is not supported inside oneof '${ctx.oneof.name}'`);
+    } else if (ctx.messageNames.has(field.type)) {
+      defaultDiagnostic(Range.create(field.line, defaultToken.tokenStart, field.line, defaultToken.tokenEnd), `default is not supported on message-typed field '${field.name}'`);
+    } else if (field.type === 'bool') {
+      if (defaultToken.value !== 'true' && defaultToken.value !== 'false') {
+        defaultDiagnostic(Range.create(field.line, defaultToken.valueStart, field.line, defaultToken.valueEnd), `default for bool must be 'true' or 'false', got '${defaultToken.value}'`);
+      }
+    } else if (INT_RANGES[field.type]) {
+      const parsed = parseIntegerLiteral(defaultToken.value);
+      const range = INT_RANGES[field.type];
+      if (parsed === null || parsed < range.min || parsed > range.max) {
+        defaultDiagnostic(Range.create(field.line, defaultToken.valueStart, field.line, defaultToken.valueEnd), `default for ${field.type} must be an integer in range ${range.min}..${range.max}, got '${defaultToken.value}'`);
+      }
+    } else if (field.type === 'float' || field.type === 'double') {
+      const value = defaultToken.value.trim();
+      const numberPattern = /^[+-]?(?:(?:\d+\.?\d*)|(?:\.\d+))(?:[eE][+-]?\d+)?$/;
+      const parsed = Number(value);
+      if (!numberPattern.test(value) || !Number.isFinite(parsed) || (field.type === 'float' && Math.abs(parsed) > 3.4028235e38)) {
+        defaultDiagnostic(Range.create(field.line, defaultToken.valueStart, field.line, defaultToken.valueEnd), `default for ${field.type} must be a finite floating-point value, got '${defaultToken.value}'`);
+      }
+    } else if (field.type === 'string') {
+      const value = defaultToken.value.trim();
+      if (!/^"(?:[^"\\]|\\.)*"$/.test(value)) {
+        defaultDiagnostic(Range.create(field.line, defaultToken.valueStart, field.line, defaultToken.valueEnd), `default for string must be a quoted literal, got '${defaultToken.value}'`);
+      } else {
+        const limitOption = field.options['size'] ?? field.options['max_size'];
+        const limit = limitOption === undefined ? null : parseIntegerLiteral(limitOption);
+        if (limit !== null && Buffer.byteLength(unescapeDefaultString(value), 'utf8') > Number(limit)) {
+          defaultDiagnostic(Range.create(field.line, defaultToken.valueStart, field.line, defaultToken.valueEnd), `default string exceeds ${limitOption === field.options['size'] ? 'size' : 'max_size'}=${limitOption}`);
+        }
+      }
+    } else {
+      const enumDefinition = ctx.allDefs.enums.find(enm => enm.name === field.type);
+      if (enumDefinition) {
+        const validMember = enumDefinition.values.some(value => value.name === defaultToken.value);
+        if (!/^[A-Za-z_]\w*$/.test(defaultToken.value) || !validMember) {
+          defaultDiagnostic(Range.create(field.line, defaultToken.valueStart, field.line, defaultToken.valueEnd), `default for enum '${field.type}' must be one of: ${enumDefinition.values.map(value => value.name).join(', ')}`);
+        }
+      }
+    }
+  }
+
+  const hasSize = 'size' in field.options;
+  const hasMaxSize = 'max_size' in field.options;
+  const hasElementSize = 'element_size' in field.options;
+  if (field.type === 'string' && !field.repeated) {
+    if (!hasSize && !hasMaxSize) diagnostics.push(makeDiagnostic(field.line, `String field '${field.name}' requires [size=N] or [max_size=N]`, DiagnosticSeverity.Error, { fix: 'add_size', fieldLine: field.line }));
+    else if (hasSize && hasMaxSize) diagnostics.push(makeDiagnostic(field.line, `String field '${field.name}' cannot have both size and max_size`));
+    if (hasElementSize) diagnostics.push(makeDiagnostic(field.line, `element_size is only valid on repeated string fields`));
+  } else if (field.type === 'string' && field.repeated) {
+    if (!hasSize && !hasMaxSize) diagnostics.push(makeDiagnostic(field.line, `Repeated string field '${field.name}' requires [size=N] or [max_size=N]`, DiagnosticSeverity.Error, { fix: 'add_size', fieldLine: field.line }));
+    else if (hasSize && hasMaxSize) diagnostics.push(makeDiagnostic(field.line, `Repeated string field '${field.name}' cannot have both size and max_size`));
+    if (!hasElementSize) diagnostics.push(makeDiagnostic(field.line, `Repeated string field '${field.name}' requires [element_size=M]`, DiagnosticSeverity.Error, { fix: 'add_element_size', fieldLine: field.line }));
+  } else if (field.repeated && PRIMITIVE_TYPES.includes(field.type)) {
+    if (!hasSize && !hasMaxSize) diagnostics.push(makeDiagnostic(field.line, `Repeated field '${field.name}' requires [size=N] or [max_size=N]`, DiagnosticSeverity.Error, { fix: 'add_size', fieldLine: field.line }));
+    else if (hasSize && hasMaxSize) diagnostics.push(makeDiagnostic(field.line, `Repeated field '${field.name}' cannot have both size and max_size`));
+    if (hasElementSize) diagnostics.push(makeDiagnostic(field.line, `element_size is only valid on repeated string fields`));
+  } else if (field.repeated && ctx.messageNames.has(field.type)) {
+    if (!hasSize && !hasMaxSize) diagnostics.push(makeDiagnostic(field.line, `Repeated message field '${field.name}' requires [size=N] or [max_size=N]`, DiagnosticSeverity.Error, { fix: 'add_size', fieldLine: field.line }));
+    else if (hasSize && hasMaxSize) diagnostics.push(makeDiagnostic(field.line, `Repeated message field '${field.name}' cannot have both size and max_size`));
+    if (hasElementSize) diagnostics.push(makeDiagnostic(field.line, `element_size is only valid on repeated string fields`));
+  }
+
+  if (hasSize) {
+    const sizeVal = parseIntegerLiteral(field.options['size']);
+    if (sizeVal === null || sizeVal < 1n || sizeVal > 65535n) diagnostics.push(makeDiagnostic(field.line, `'size' must be 1–65535, got '${field.options['size']}'`));
+  }
+  if (hasMaxSize) {
+    const maxSizeVal = parseIntegerLiteral(field.options['max_size']);
+    if (maxSizeVal === null || maxSizeVal < 1n || maxSizeVal > 65535n) diagnostics.push(makeDiagnostic(field.line, `'max_size' must be 1–65535, got '${field.options['max_size']}'`));
+    else if (maxSizeVal > 255n) diagnostics.push(makeDiagnostic(field.line, `max_size=${maxSizeVal} > 255: count/length prefix will be uint16 (2 bytes) instead of uint8 (1 byte)`, DiagnosticSeverity.Information));
+  }
+  if (hasElementSize) {
+    const elementSizeVal = parseIntegerLiteral(field.options['element_size']);
+    if (elementSizeVal === null || elementSizeVal < 1n || elementSizeVal > 65535n) diagnostics.push(makeDiagnostic(field.line, `'element_size' must be 1–65535, got '${field.options['element_size']}'`));
+  }
+
+  if (field.options['flatten'] === 'true') {
+    if (!ctx.messageNames.has(field.type)) diagnostics.push(makeDiagnostic(field.line, `flatten is only valid on message-type fields ('${field.type}' is not a known message)`));
+    else {
+      diagnostics.push(makeDiagnostic(field.line, `flatten=true only affects Python and GraphQL output; has no effect on C, C++, C#, TypeScript, or Rust`, DiagnosticSeverity.Information));
+      const nestedMsg = ctx.allDefs.messages.find(message => message.name === field.type);
+      if (nestedMsg) {
+        const parentFieldNames = new Set(ctx.siblingFieldNames.filter(sibling => sibling.name !== field.name).map(sibling => sibling.name));
+        for (const nestedField of nestedMsg.fields) {
+          if (parentFieldNames.has(nestedField.name)) diagnostics.push(makeDiagnostic(field.line, `flatten: field '${nestedField.name}' from '${field.type}' collides with existing field in '${ctx.msg.name}'`));
+        }
+      }
+    }
+  }
+}
+
 function validateDocument(uri: string): void {
   const parsed = getOrParseDocument(uri);
   const diagnostics: Diagnostic[] = [];
@@ -728,11 +1002,16 @@ function validateDocument(uri: string): void {
         `option variable must be 'true' or 'false', got '${msg.options['variable']}'`));
     }
 
-    // variable=true with no max_size fields is pointless
+    // variable=true with no variable-length field is pointless
     if (msg.options['variable'] === 'true') {
       const allFields = [...msg.fields, ...msg.oneofs.flatMap(o => o.fields)];
       const hasMaxSizeField = allFields.some(f => 'max_size' in f.options);
-      if (!hasMaxSizeField) {
+      const hasVariableLengthOneof = msg.oneofs.some(oneof =>
+        oneof.options['variable'] === 'true' ||
+        'max_size' in oneof.options ||
+        'min_size' in oneof.options
+      );
+      if (!hasMaxSizeField && !hasVariableLengthOneof) {
         diagnostics.push(makeDiagnostic(
           msg.optionLines['variable'] ?? msg.line,
           `option variable=true has no effect: no fields use [max_size=N] in '${msg.name}'`,
@@ -788,13 +1067,15 @@ function validateDocument(uri: string): void {
           `option extensions_start must be an integer ≥ 2, got '${extStartStr}'`));
       } else {
         const extStart = parseInt(extStartStr, 10);
-        if (extStart < 2) {
+        if (msg.oneofs.length > 0) {
+          diagnostics.push(makeDiagnostic(optLine,
+            `message-level extensions_start cannot be combined with oneof fields; use oneof-level extensions_start`));
+        } else if (extStart < 2) {
           diagnostics.push(makeDiagnostic(optLine,
             `option extensions_start must be an integer ≥ 2, got '${extStartStr}'`));
         } else {
           const allFieldTags = new Set([
-            ...msg.fields.map(f => f.tag),
-            ...msg.oneofs.flatMap(o => o.fields.map(f => f.tag))
+            ...msg.fields.map(f => f.tag)
           ]);
           if (!allFieldTags.has(extStart)) {
             diagnostics.push(makeDiagnostic(optLine,
@@ -805,7 +1086,7 @@ function validateDocument(uri: string): void {
     }
 
     // Unknown oneof-level option names
-    const VALID_ONEOF_OPTIONS = new Set(['discriminator', 'extensions_start']);
+    const VALID_ONEOF_OPTIONS = new Set(ONEOF_OPTION_NAMES);
     for (const oneof of msg.oneofs) {
       for (const optName of Object.keys(oneof.options)) {
         if (!VALID_ONEOF_OPTIONS.has(optName)) {
@@ -815,6 +1096,51 @@ function validateDocument(uri: string): void {
             DiagnosticSeverity.Warning
           ));
         }
+      }
+    }
+
+    for (const oneof of msg.oneofs) {
+      const variable = oneof.options['variable'];
+      const variableLine = oneof.optionLines['variable'] ?? oneof.line;
+      if (variable !== undefined && variable !== 'true' && variable !== 'false') {
+        diagnostics.push(makeDiagnostic(variableLine,
+          `oneof option variable must be 'true' or 'false', got '${variable}'`));
+      }
+      if (variable === 'true' && msg.options['variable'] !== 'true') {
+        diagnostics.push(makeDiagnostic(variableLine,
+          `oneof variable=true requires parent message '${msg.name}' to use option variable = true`,
+          DiagnosticSeverity.Error,
+          { fix: 'add_msg_variable', msgName: msg.name }));
+      }
+
+      const maxSize = oneof.options['max_size'];
+      const maxSizeLine = oneof.optionLines['max_size'] ?? oneof.line;
+      const parsedMaxSize = maxSize === undefined ? null : parseIntegerLiteral(maxSize);
+      if (maxSize !== undefined && (parsedMaxSize === null || parsedMaxSize <= 0n || parsedMaxSize > 65535n)) {
+        diagnostics.push(makeDiagnostic(maxSizeLine,
+          `oneof max_size must be a positive integer <= 65535, got '${maxSize}'`));
+      }
+      if (maxSize !== undefined && variable === 'true') {
+        diagnostics.push(makeDiagnostic(maxSizeLine,
+          `oneof max_size is only valid on non-variable oneofs`));
+      }
+
+      const minSize = oneof.options['min_size'];
+      const minSizeLine = oneof.optionLines['min_size'] ?? oneof.line;
+      const parsedMinSize = minSize === undefined ? null : parseIntegerLiteral(minSize);
+      if (minSize !== undefined && (parsedMinSize === null || parsedMinSize <= 0n)) {
+        diagnostics.push(makeDiagnostic(minSizeLine,
+          `oneof min_size must be a positive integer, got '${minSize}'`));
+      }
+      const minSizeApplicable = msg.fields.every(field => !('max_size' in field.options)) && msg.oneofs.length === 1;
+      if (minSize !== undefined && !minSizeApplicable) {
+        diagnostics.push(makeDiagnostic(minSizeLine,
+          `oneof min_size may only be used when this is the sole variable-length field`,
+          DiagnosticSeverity.Warning));
+      }
+      if (parsedMinSize !== null && parsedMaxSize !== null && parsedMinSize > parsedMaxSize) {
+        diagnostics.push(makeDiagnostic(minSizeLine,
+          `oneof min_size must not exceed max_size`));
       }
     }
 
@@ -914,8 +1240,9 @@ function validateDocument(uri: string): void {
       }
     }
 
-    // Field-level validation
-    for (const field of msg.fields) {
+    if (false) {
+      // Retained temporarily while the main-specific validator is replaced.
+      for (const field of msg.fields) {
       const hasSize = 'size' in field.options;
       const hasMaxSize = 'max_size' in field.options;
       const hasElementSize = 'element_size' in field.options;
@@ -1020,7 +1347,7 @@ function validateDocument(uri: string): void {
             const parentFieldNames = new Set(
               msg.fields.filter(f => f.name !== field.name).map(f => f.name)
             );
-            for (const nf of nestedMsg.fields) {
+            for (const nf of nestedMsg?.fields ?? []) {
               if (parentFieldNames.has(nf.name)) {
                 diagnostics.push(makeDiagnostic(field.line,
                   `flatten: field '${nf.name}' from '${field.type}' collides with existing field in '${msg.name}'`));
@@ -1028,6 +1355,27 @@ function validateDocument(uri: string): void {
             }
           }
         }
+      }
+      }
+    }
+    for (const field of msg.fields) {
+      validateField(field, {
+        msg,
+        oneof: null,
+        messageNames,
+        allDefs,
+        siblingFieldNames: msg.fields
+      }, diagnostics);
+    }
+    for (const oneof of msg.oneofs) {
+      for (const field of oneof.fields) {
+        validateField(field, {
+          msg,
+          oneof,
+          messageNames,
+          allDefs,
+          siblingFieldNames: [...msg.fields, ...oneof.fields]
+        }, diagnostics);
       }
     }
   }
@@ -1103,7 +1451,7 @@ function getOrParseDocument(uri: string): ParsedDocument {
     }
   }
 
-  const parsed = parseDocument(uri, content);
+  const parsed = parser.parseDocument(uri, content);
   parsedDocuments.set(uri, parsed);
   return parsed;
 }
@@ -1180,8 +1528,7 @@ function getContextAtLine(text: string, lineNum: number): { inMessage: boolean; 
 
   for (let i = 0; i <= lineNum && i < lines.length; i++) {
     const rawLine = lines[i];
-    const commentIdx = rawLine.indexOf('//');
-    const line = commentIdx >= 0 ? rawLine.substring(0, commentIdx) : rawLine;
+    const line = parser.stripLineComment(rawLine);
     const trimmed = line.trim();
     if (!trimmed) continue;
 
@@ -1364,6 +1711,7 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
   const lines = text.split('\n');
   const lineText = lines[params.position.line] || '';
   const lineUpToCursor = lineText.substring(0, params.position.character);
+  const { inMessage, inOneof, inEnum } = getContextAtLine(text, params.position.line);
 
   // ── 0. Inside import "..." string ─────────────────────────────────────
   const importPathMatch = lineUpToCursor.match(/^\s*import\s+"([^"]*)$/);
@@ -1376,6 +1724,44 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
   const bracketEnd = lineUpToCursor.lastIndexOf(']');
   if (bracketStart > bracketEnd && bracketStart >= 0) {
     const afterBracket = lineUpToCursor.substring(bracketStart + 1);
+    const beforeBracket = lineText.substring(0, bracketStart).trimEnd();
+    const isRepeated = /^\s*repeated\b/.test(lineText);
+    const fieldTypeMatch = beforeBracket.match(/(?:repeated\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*\d+\s*$/);
+    const fieldType = fieldTypeMatch ? fieldTypeMatch[1] : '';
+    const allDefs = getAllDefinitions(params.textDocument.uri);
+    const isPrimitiveType = PRIMITIVE_TYPES.includes(fieldType);
+    const isEnumType = allDefs.enums.some(enm => enm.name === fieldType) || isEnumInCompileConfig(fieldType);
+    const isStringType = fieldType === 'string';
+    const isMsgType = !isPrimitiveType && !isEnumType && /^[A-Z]/.test(fieldType);
+
+    if (!isRepeated && !isMsgType && !inOneof && fieldType !== '' &&
+      /(?:^|,)\s*(?:(?:sf|struct_frame)\.)?default\s*=\s*$/.test(afterBracket)) {
+      if (fieldType === 'bool') {
+        return [
+          { label: 'true', kind: CompletionItemKind.Value },
+          { label: 'false', kind: CompletionItemKind.Value }
+        ];
+      }
+      const enumDefinition = allDefs.enums.find(enm => enm.name === fieldType);
+      if (enumDefinition) {
+        return enumDefinition.values.map(value => ({
+          label: value.name,
+          kind: CompletionItemKind.EnumMember,
+          detail: `= ${value.value}`
+        }));
+      }
+      if (isStringType) {
+        return [{
+          label: '"value"',
+          kind: CompletionItemKind.Snippet,
+          insertText: '"${1:value}"',
+          insertTextFormat: InsertTextFormat.Snippet
+        }];
+      }
+      if (INT_RANGES[fieldType]) return [{ label: '0', kind: CompletionItemKind.Value }];
+      if (fieldType === 'float' || fieldType === 'double') return [{ label: '0.0', kind: CompletionItemKind.Value }];
+    }
+
     // Value completion for flatten=
     if (/(?:^|,)\s*(?:(?:sf|struct_frame)\.)?flatten\s*=\s*$/.test(afterBracket)) {
       return [
@@ -1390,19 +1776,13 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
         'max_size=': { detail: 'Field option', documentation: 'Bounded variable-size (1–65535). Strings: length prefix + up to N bytes. Arrays: count prefix + up to N elements. Count prefix is uint8 (1 byte) when N ≤ 255, uint16 (2 bytes) when N > 255.' },
         'element_size=': { detail: 'Field option', documentation: 'Only for `repeated string` arrays (1–65535). Size in bytes reserved for each string element. Must be combined with `size=` or `max_size=`.' },
         'flatten=': { detail: 'Field option', documentation: 'Only on message-type fields. Inlines the nested message fields directly into the parent. Field names must not collide. Affects Python and GraphQL output only; no effect on C, C++, C#, TypeScript, or Rust.' },
+        'default=': { detail: 'Field option', documentation: 'Initialization fallback for integer, bool, float, double, enum, and sized or bounded string fields. No effect on wire layout, size, or magic bytes.' },
       };
       // Parse the field declaration before the [ to determine what options are applicable
-      const beforeBracket = lineText.substring(0, bracketStart).trimEnd();
-      const isRepeated = /^\s*repeated\b/.test(lineText);
-      const fieldTypeMatch = beforeBracket.match(/(?:repeated\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*\d+\s*$/);
-      const fieldType = fieldTypeMatch ? fieldTypeMatch[1] : '';
-      const isPrimitiveType = PRIMITIVE_TYPES.includes(fieldType);
-      const isStringType = fieldType === 'string';
-      const isMsgType = !isPrimitiveType && /^[A-Z]/.test(fieldType);
-
       const applicableOpts = FIELD_OPTION_NAMES.filter(opt => {
         if (opt === 'element_size=') return isRepeated && isStringType;
         if (opt === 'flatten=') return !isRepeated && isMsgType;
+        if (opt === 'default=') return !isRepeated && !isMsgType && !inOneof && fieldType !== '';
         return true; // size= and max_size= always applicable
       });
 
@@ -1439,10 +1819,7 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
     return [];
   }
 
-  // ── 2. Context detection (stack-based scan, works for unclosed blocks) ──
-  const { inMessage, inOneof, inEnum } = getContextAtLine(text, params.position.line);
-
-  // ── 3. option <name> ── suggest context-appropriate option names ─────────
+  // ── 2. option <name> ── suggest context-appropriate option names ─────────
   if (/^\s*option\s+$/.test(lineUpToCursor)) {
     const optNames = inOneof ? ONEOF_OPTION_NAMES
       : inMessage ? MESSAGE_OPTION_NAMES
@@ -1498,24 +1875,19 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
       .filter(m => m.line <= currentLine && currentLine <= (m.endLine ?? Infinity))
       .sort((a, b) => b.line - a.line)[0];
     if (containingMsg) {
-      const allTags = [
-        ...containingMsg.fields.map(f => f.tag),
-        ...containingMsg.oneofs.flatMap(o => o.fields.map(f => f.tag))
-      ];
       // Check if we're inside a oneof
       const containingOneof = containingMsg.oneofs.find(
         o => o.line <= currentLine && currentLine <= (o.endLine ?? Infinity)
       );
       const scopeTags = containingOneof
         ? containingOneof.fields.map(f => f.tag)
-        : allTags;
-      if (scopeTags.length > 0) {
-        const maxTag = Math.max(...scopeTags);
-        const suggested = Math.max(maxTag + 1, 2);
-        return [{ label: String(suggested), kind: CompletionItemKind.Value, detail: 'First extension field number' }];
+        : containingMsg.fields.map(f => f.tag);
+      const extensionTags = scopeTags.filter(tag => tag >= 2);
+      if (extensionTags.length > 0) {
+        return extensionTags.map(tag => ({ label: String(tag), kind: CompletionItemKind.Value, detail: 'Existing extension field number' }));
       }
     }
-    return [{ label: '2', kind: CompletionItemKind.Value, detail: 'First extension field number (≥ 2)' }];
+    return [{ label: '2', kind: CompletionItemKind.Value, detail: 'Existing field number required' }];
   }
   if (/^\s*option\s+magic_bytes\s*=\s*$/.test(lineUpToCursor)) {
     return [
@@ -1543,10 +1915,12 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
         .filter(m => m.line <= currentLine && currentLine <= (m.endLine ?? Infinity))
         .sort((a, b) => b.line - a.line)[0]; // innermost (latest start)
       if (containingMsg) {
-        const usedTags = new Set<number>([
-          ...containingMsg.fields.map(f => f.tag),
-          ...containingMsg.oneofs.flatMap(o => o.fields.map(f => f.tag))
-        ]);
+        const containingOneof = containingMsg.oneofs.find(
+          oneof => oneof.line <= currentLine && currentLine <= (oneof.endLine ?? Infinity)
+        );
+        const usedTags = new Set<number>(containingOneof
+          ? containingOneof.fields.map(f => f.tag)
+          : containingMsg.fields.map(f => f.tag));
         let nextTag = 1;
         while (usedTags.has(nextTag)) nextTag++;
         return [{ label: String(nextTag), kind: CompletionItemKind.Value, detail: 'Next available field number', sortText: '0' }];
@@ -2091,6 +2465,9 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
         discriminator: '**discriminator** *(oneof option)*\n\nControls how the oneof variant is identified during deserialization:\n- `"auto"` — uses `msgid` if all variants have one, otherwise `field_order`\n- `"msgid"` — uint16 discriminator by message ID\n- `"field_order"` — uint8 1-based field index; generates a companion enum\n- `"none"` — no discriminator stored; caller handles disambiguation manually',
         extensions_start: '**extensions_start** *(message/oneof option)*\n\nFirst extension field number (must be ≥ 2). Fields with this number or higher are **extension fields** — newer senders include them; older receivers zero-fill them on reception.\n\nMagic bytes and base-size computations use only the fields *before* this number. Adding extension fields never changes the magic bytes.',
         magic_bytes: '**magic_bytes** *(message option)*\n\nOverrides the auto-calculated two-byte CRC seed, e.g. `"0xA3, 0x7F"`. Use when a schema change (e.g. renaming an enum) would alter the calculated magic bytes but the wire layout is genuinely unchanged.\n\n- Exactly two comma-separated values required\n- Each value must be 1–255 (hex or decimal)\n- Prefer the calculated bytes unless intentional wire-compatibility is needed',
+        max_size: '**max_size** *(oneof option)*\n\nMaximum size for a non-variable oneof. Cannot be combined with `variable = true`.',
+        min_size: '**min_size** *(oneof option)*\n\nMinimum size for an applicable variable-length oneof.',
+        default: '**default=value** *(field option)*\n\nInitialization fallback for integer, bool, float, double, enum, and fixed or bounded string fields. It is not supported on repeated, message-typed, or oneof fields, and has no effect on wire layout, size, or magic bytes.',
       };
       if (OPT_DOCS[word]) {
         return { contents: { kind: MarkupKind.Markdown, value: OPT_DOCS[word] } };
@@ -2136,11 +2513,9 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
   if (/^\d+$/.test(word)) {
     const lineText = doc.getText().split('\n')[params.position.line] || '';
     // Field tag: `Type fieldname = N;` or `repeated Type fieldname = N [opts];`
-    const fieldTagMatch = lineText.match(
-      /^\s*(repeated\s+)?[a-zA-Z_][a-zA-Z0-9_]*\s+[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*(\d+)\s*(?:\[([^\]]*)\])?\s*;/
-    );
-    if (fieldTagMatch && fieldTagMatch[2] === word) {
-      const tag = parseInt(word, 10);
+    const fieldTagMatch = parser.matchFieldDeclaration(lineText);
+    if (fieldTagMatch && params.position.character >= fieldTagMatch.tagStart && params.position.character < fieldTagMatch.tagEnd) {
+      const tag = fieldTagMatch.tag;
       return {
         contents: {
           kind: MarkupKind.Markdown,
@@ -2192,7 +2567,7 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
           }
         };
       }
-      const fieldLines = msg.fields.map(f => `  ${f.repeated ? 'repeated ' : ''}${f.type} ${f.name} = ${f.tag};`).join('\n');
+      const fieldLines = msg.fields.map(f => `  ${f.repeated ? 'repeated ' : ''}${f.type} ${f.name} = ${f.tag}${f.optionsRaw ? ` [${f.optionsRaw}]` : ''};`).join('\n');
       const optLines = Object.entries(msg.options).map(([k, v]) => `  option ${k} = ${v};`).join('\n');
       const body = [optLines, fieldLines].filter(Boolean).join('\n');
       return {
@@ -2215,11 +2590,13 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
           }
         };
       }
+      const enumOptionLines = Object.entries(enm.options ?? {}).map(([key, value]) => `  option ${key} = ${value};`).join('\n');
       const valueLines = enm.values.map(v => `  ${v.name} = ${v.value};`).join('\n');
+      const enumBody = [enumOptionLines, valueLines].filter(Boolean).join('\n');
       return {
         contents: {
           kind: MarkupKind.Markdown,
-          value: `**enum ${word}**${enm.parentMessage ? ` (nested in \`${enm.parentMessage}\`)` : ''}\n\`\`\`sf\nenum ${word} {\n${valueLines}\n}\n\`\`\`${generatedSection}`
+          value: `**enum ${word}**${enm.parentMessage ? ` (nested in \`${enm.parentMessage}\`)` : ''}\n\`\`\`sf\nenum ${word} {\n${enumBody}\n}\n\`\`\`${generatedSection}`
         }
       };
     }
@@ -2340,22 +2717,21 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
   // Field name hover — show type, tag, and options inline
   {
     const lineText = doc.getText().split('\n')[params.position.line] || '';
-    const fieldMatch = lineText.match(
-      /^(\s*)(repeated\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([0-9]+)\s*(?:\[([^\]]*)\])?\s*;/
-    );
-    if (fieldMatch && word === fieldMatch[4]) {
-      const repeated = !!fieldMatch[2];
-      const type = fieldMatch[3];
-      const tag = fieldMatch[5];
-      const opts = fieldMatch[6] ? `  // [${fieldMatch[6]}]` : '';
+    const fieldMatch = parser.matchFieldDeclaration(lineText);
+    if (fieldMatch && word === fieldMatch.name && params.position.character >= fieldMatch.nameStart && params.position.character < fieldMatch.nameEnd) {
+      const repeated = fieldMatch.repeated;
+      const type = fieldMatch.type;
+      const tag = String(fieldMatch.tag);
+      const opts = fieldMatch.optionsRaw ? `  // [${fieldMatch.optionsRaw}]` : '';
       const typeLabel = repeated ? `repeated ${type}` : type;
       const sizeNotes: string[] = [];
-      if (fieldMatch[6]) {
-        const parsedOpts = parseFieldOptions(fieldMatch[6]);
+      if (fieldMatch.optionsRaw) {
+        const parsedOpts = parseFieldOptions(fieldMatch.optionsRaw);
         if (parsedOpts['size']) sizeNotes.push(`fixed size: **${parsedOpts['size']}** bytes/elements`);
         if (parsedOpts['max_size']) sizeNotes.push(`max size: **${parsedOpts['max_size']}** (+ count prefix)`);
         if (parsedOpts['element_size']) sizeNotes.push(`element size: **${parsedOpts['element_size']}** bytes each`);
         if (parsedOpts['flatten'] === 'true') sizeNotes.push('fields flattened into parent');
+        if (parsedOpts['default']) sizeNotes.push(`default: **${parsedOpts['default']}**`);
       }
       const notes = sizeNotes.length ? `\n\n${sizeNotes.map(n => `- ${n}`).join('\n')}` : '';
       return {
@@ -2375,8 +2751,8 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
       message: '**message** *(keyword)*\n\nDefines a fixed-size packed struct. Requires `option msgid` for top-level routable messages. Fields must have unique field numbers.\n\n```sf\nmessage Heartbeat {\n  option msgid = 1;\n  uint64 timestamp = 1;\n}\n```',
       enum: '**enum** *(keyword)*\n\nDefines an enumeration stored as `uint8` (1 byte). Values must be unique within the enum. Can be defined at file level or nested inside a message.\n\n```sf\nenum State { IDLE = 0; RUNNING = 1; }\n```',
       repeated: '**repeated** *(keyword)*\n\nDeclares an array field. Must specify `[size=N]` (fixed array) or `[max_size=N]` (variable-count array, 1–65535 elements). For `repeated string` arrays, also requires `[element_size=M]`.\n\nThe count prefix size is automatic: `uint8` (1 byte) when `max_size` ≤ 255, `uint16` (2 bytes) when `max_size` > 255.\n\nAvailable snippets:\n- `repeated <primitive>` — fixed/bounded array of primitive values\n- `repeated string` — array of strings with element_size\n- `repeated <message>` — array of nested messages',
-      oneof: '**oneof** *(keyword)*\n\nDeclares a union field where only one variant is active at a time. All variants share the same memory (size of largest type). Generates an auto-discriminator field.',
-      option: '**option** *(keyword)*\n\nSets a message, oneof, or file-level option. Common options: `msgid`, `pkgid`, `variable`, `is_envelope`, `discriminator`.',
+      oneof: '**oneof** *(keyword)*\n\nDeclares a union field where only one variant is active at a time. Oneof options include `discriminator`, `variable`, `max_size`, `min_size`, and `extensions_start`.',
+      option: '**option** *(keyword)*\n\nSets a message, oneof, or file-level option. Message options include `msgid`, `variable`, `is_envelope`, `magic_bytes`, and `extensions_start`; `default` is a field option written inside `[...]`.',
     };
     if (KEYWORD_DOCS[word]) {
       return { contents: { kind: MarkupKind.Markdown, value: KEYWORD_DOCS[word] } };
@@ -2471,6 +2847,35 @@ connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
 
     const lineNum = diag.range.start.line;
     const lineText = doc.getText().split('\n')[lineNum] ?? '';
+
+    if (data.fix === 'remove_default') {
+      const tokenStart = typeof data.tokenStart === 'number' ? data.tokenStart : diag.range.start.character;
+      const tokenEnd = typeof data.tokenEnd === 'number' ? data.tokenEnd : diag.range.end.character;
+      const onlyOption = data.onlyOption === true;
+      const bracketStart = typeof data.bracketStart === 'number' ? data.bracketStart : tokenStart;
+      const bracketEnd = typeof data.bracketEnd === 'number' ? data.bracketEnd : tokenEnd;
+      let editRange: Range;
+      if (onlyOption) {
+        const start = bracketStart > 0 && lineText[bracketStart - 1] === ' ' ? bracketStart - 1 : bracketStart;
+        editRange = Range.create(lineNum, start, lineNum, bracketEnd + 1);
+      } else if (lineText[tokenEnd] === ',') {
+        editRange = Range.create(lineNum, tokenStart, lineNum, tokenEnd + 1);
+      } else if (tokenStart > 0 && lineText[tokenStart - 1] === ',') {
+        editRange = Range.create(lineNum, tokenStart - 1, lineNum, tokenEnd);
+      } else {
+        editRange = Range.create(lineNum, tokenStart, lineNum, tokenEnd);
+      }
+      actions.push({
+        title: 'Remove [default = ...]',
+        kind: CodeActionKind.QuickFix,
+        diagnostics: [diag],
+        edit: {
+          changes: {
+            [params.textDocument.uri]: [TextEdit.del(editRange)]
+          }
+        }
+      });
+    }
 
     if (data.fix === 'add_size') {
       // Strip semicolon from end so we can append before it
@@ -2592,6 +2997,28 @@ connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
         diagnostics: [diag],
         edit,
       });
+    }
+
+    if (data.fix === 'add_msg_variable') {
+      const targetMsgName = data.msgName as string | undefined;
+      if (targetMsgName) {
+        const parsedDoc = getOrParseDocument(params.textDocument.uri);
+        const targetMsg = parsedDoc.messages.find(m => m.name === targetMsgName);
+        if (targetMsg) {
+          actions.push({
+            title: `Add 'option variable = true' to '${targetMsgName}'`,
+            kind: CodeActionKind.QuickFix,
+            diagnostics: [diag],
+            edit: {
+              changes: {
+                [params.textDocument.uri]: [
+                  TextEdit.insert(Position.create(targetMsg.line + 1, 0), '  option variable = true;\n')
+                ]
+              }
+            }
+          });
+        }
+      }
     }
 
     if (data.fix === 'add_variable_true') {
@@ -2814,11 +3241,19 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
 
   if (!/^[A-Z]/.test(word) || !/^[A-Z]/.test(newName)) return null;
 
-  // Collect all open .sf documents to search
-  const urisToSearch = new Set<string>([params.textDocument.uri]);
-  for (const [uri] of parsedDocuments) {
-    if (uri.endsWith('.sf')) urisToSearch.add(uri);
-  }
+  const urisToSearch = new Set<string>();
+  const collectReachableDocuments = (uri: string, visited = new Set<string>()): void => {
+    if (visited.has(uri)) return;
+    visited.add(uri);
+    urisToSearch.add(uri);
+    const parsed = getOrParseDocument(uri);
+    for (const importPath of parsed.imports) {
+      const importUri = resolveImportUri(importPath, uri);
+      const importFile = importUri.startsWith('file://') ? fileURLToPath(importUri) : importUri;
+      if (fs.existsSync(importFile)) collectReachableDocuments(importUri, visited);
+    }
+  };
+  collectReachableDocuments(params.textDocument.uri);
 
   const changes: Record<string, TextEdit[]> = {};
 
